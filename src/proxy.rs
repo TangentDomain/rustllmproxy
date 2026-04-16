@@ -39,7 +39,9 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(config: Arc<Config>, balancer: Arc<WeightedRoundRobin>) -> Self {
         let client = Client::builder()
-            .timeout(Duration::from_secs(config.server.timeout_secs))
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(5))
             .build()
             .expect("failed to build reqwest client");
         Self { config, balancer, limiter: Arc::new(RateLimiter::new()), client }
@@ -118,8 +120,13 @@ impl Proxy {
             // 每个健康后端只试1次，轮询而非重试同一个
             for selected in &healthy {
                 let resolved = selected.resolve_model(try_model);
-                body_json["model"] = serde_json::Value::String(resolved.clone());
-                let body_bytes = serde_json::to_vec(&body_json).unwrap_or_default();
+                // 只有 model 真正改变时才重新序列化
+                let body_bytes: Vec<u8> = if resolved == *try_model && body_json["model"].as_str() == Some(try_model.as_str()) {
+                    bytes.to_vec()
+                } else {
+                    body_json["model"] = serde_json::Value::String(resolved.clone());
+                    serde_json::to_vec(&body_json).unwrap_or_default()
+                };
 
                 match self.do_forward(&path, &parts.headers, &body_bytes, selected).await {
                     Ok(resp) => {
@@ -227,7 +234,10 @@ impl Proxy {
 
     async fn stream_response(&self, resp: reqwest::Response) -> Response<Body> {
         let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-        let mut builder = Response::builder().status(status);
+        let mut builder = Response::builder()
+            .status(status)
+            .header("x-accel-buffering", "no")
+            .header("cache-control", "no-cache");
         for (key, value) in resp.headers() {
             if matches!(key.as_str(), "content-type" | "content-encoding") {
                 builder = builder.header(key, value);

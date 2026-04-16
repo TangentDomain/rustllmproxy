@@ -5,8 +5,8 @@ use axum::{
     response::Response,
 };
 use crate::config::Config;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use dashmap::{DashMap, Entry};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 每个key的限流状态
@@ -23,7 +23,7 @@ impl Default for RateLimitEntry {
 
 #[derive(Default)]
 pub struct RateLimiter {
-    entries: Mutex<HashMap<String, RateLimitEntry>>,
+    entries: DashMap<String, RateLimitEntry>,
 }
 
 impl RateLimiter {
@@ -33,16 +33,22 @@ impl RateLimiter {
 
     /// 返回 true 表示允许，false 表示被限流
     pub fn check(&self, key: &str, limit: u32) -> bool {
-        let mut entries = self.entries.lock().unwrap();
         let now = Instant::now();
-        let entry = entries.entry(key.to_string()).or_default();
-        // 1分钟窗口
-        if now.duration_since(entry.window_start).as_secs() >= 60 {
-            entry.count = 0;
-            entry.window_start = now;
+        match self.entries.entry(key.to_string()) {
+            Entry::Occupied(mut e) => {
+                let entry = e.get_mut();
+                if now.duration_since(entry.window_start).as_secs() >= 60 {
+                    entry.count = 0;
+                    entry.window_start = now;
+                }
+                entry.count += 1;
+                entry.count <= limit
+            }
+            Entry::Vacant(e) => {
+                e.insert(RateLimitEntry { count: 1, window_start: now });
+                true
+            }
         }
-        entry.count += 1;
-        entry.count <= limit
     }
 }
 
