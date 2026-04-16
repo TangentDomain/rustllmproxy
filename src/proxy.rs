@@ -71,6 +71,9 @@ impl Proxy {
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
 
+        // 从扩展中获取协议类型（由 unified.rs 设置）
+        let protocol = parts.extensions.get::<String>().cloned();
+
         let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
             Ok(b) => b,
             Err(e) => {
@@ -88,13 +91,13 @@ impl Proxy {
         };
 
         let model = body_json["model"].as_str().unwrap_or("").to_string();
-        info!("Request model={model}, path={path}");
+        info!("Request model={model}, path={path}, protocol={:?}", protocol);
 
         let chain = self.config.get_fallback_chain(&model);
 
         // 按fallback链顺序尝试每个模型
         for try_model in &chain {
-            let all_backends = self.config.find_backends_for_model(try_model);
+            let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
             if all_backends.is_empty() {
                 warn!("No backend supports model={try_model}, skipping");
                 continue;

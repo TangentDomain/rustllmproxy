@@ -106,8 +106,20 @@ impl Config {
     }
 
     /// 找到所有能服务某个模型的后端
-    pub fn find_backends_for_model(&self, model: &str) -> Vec<&Backend> {
-        self.backends.iter().filter(|b| b.supports_model(model)).collect()
+    /// protocol: 可选的协议过滤 ("openai" 或 "anthropic")
+    pub fn find_backends_for_model(&self, model: &str, protocol: Option<&str>) -> Vec<&Backend> {
+        let mut backends: Vec<&Backend> = self.backends.iter()
+            .filter(|b| b.supports_model(model))
+            .collect();
+
+        // 如果指定了协议，过滤出匹配的后端
+        if let Some(proto) = protocol {
+            backends = backends.into_iter()
+                .filter(|b| b.protocol == proto)
+                .collect();
+        }
+
+        backends
     }
 
     pub fn find_api_key(&self, key: &str) -> Option<&ApiKey> {

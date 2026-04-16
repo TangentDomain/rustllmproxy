@@ -26,8 +26,8 @@ async fn main() {
     let routes = Router::new()
         .route("/openai/v1/models", get(openai_models_handler))
         .route("/anthropic/v1/models", get(anthropic_models_handler))
-        .route("/openai/v1/*path", post(openai_handler))
-        .route("/anthropic/v1/*path", post(anthropic_handler));
+        .route("/openai/v1/{*path}", post(openai_handler))
+        .route("/anthropic/v1/{*path}", post(anthropic_handler));
 
     proxy::run_server(config, routes).await;
 }
@@ -67,6 +67,10 @@ async fn openai_handler(
     let uri = req.uri().to_string();
     let new_path = uri.replacen("/openai", "", 1);
     *req.uri_mut() = new_path.parse().unwrap();
+
+    // 标记协议类型
+    req.extensions_mut().insert("openai".to_string());
+
     proxy.handle(req).await
 }
 
@@ -78,5 +82,9 @@ async fn anthropic_handler(
     let uri = req.uri().to_string();
     let new_path = uri.replacen("/anthropic", "", 1);
     *req.uri_mut() = new_path.parse().unwrap();
+
+    // 标记协议类型
+    req.extensions_mut().insert("anthropic".to_string());
+
     proxy.handle(req).await
 }
