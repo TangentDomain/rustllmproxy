@@ -50,10 +50,10 @@ stop-anthropic-proxy.bat # 停止 Anthropic 代理
 
 ## 统一代理说明
 
-统一代理自动根据 API 路径识别请求类型：
+统一代理通过路径前缀区分 API 类型：
 
-- **OpenAI 格式**：`/v1/chat/completions`, `/v1/completions`, `/v1/models`
-- **Anthropic 格式**：`/v1/messages`
+- **OpenAI API**：`/openai/v1/chat/completions`, `/openai/v1/completions`, `/openai/v1/models`
+- **Anthropic API**：`/anthropic/v1/messages`, `/anthropic/v1/models`
 
 配置文件中每个后端需指定 `protocol` 字段：
 ```toml
@@ -137,13 +137,13 @@ rate_limit = 60  # 每分钟请求限制
 
 ```bash
 # OpenAI 兼容请求
-curl http://localhost:8090/v1/chat/completions \
+curl http://localhost:8090/openai/v1/chat/completions \
   -H "Authorization: Bearer sk-proxy-default" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
 
 # Anthropic 兼容请求
-curl http://localhost:8090/v1/messages \
+curl http://localhost:8090/anthropic/v1/messages \
   -H "x-api-key: sk-proxy-default" \
   -H "Content-Type: application/json" \
   -d '{"model":"claude-3-sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'

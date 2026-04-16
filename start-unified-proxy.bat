@@ -12,5 +12,5 @@ echo.
 echo Done. Unified Proxy running on :8090
 echo.
 echo Supports both OpenAI and Anthropic APIs:
-echo   OpenAI:    http://localhost:8090/v1/chat/completions
-echo   Anthropic: http://localhost:8090/v1/messages
+echo   OpenAI:    http://localhost:8090/openai/v1/chat/completions
+echo   Anthropic: http://localhost:8090/anthropic/v1/messages
