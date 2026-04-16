@@ -132,6 +132,27 @@ curl http://localhost:8090/anthropic/v1/messages \
 
 ## 注意事项
 
-- 首次运行前需修改 `configs/unified.toml` 中的 API Key
+- 首次运行前需配置 API Key：
+  1. 复制 `.env.example` 为 `.env`
+  2. 填入真实的 API keys
+  3. Windows 下启动脚本会自动加载 `.env` 文件
 - 确保后端服务可访问
 - Windows 下建议使用 `.bat` 脚本启动
+
+## 环境变量配置
+
+支持通过 `.env` 文件配置 API keys：
+
+```bash
+# .env 文件示例
+ZHIPU_API_KEY=your_zhipu_api_key_here
+MINIMAX_API_KEY_1=your_minimax_api_key_1_here
+MINIMAX_API_KEY_2=your_minimax_api_key_2_here
+```
+
+配置文件中引用环境变量：
+```toml
+[[backends]]
+name = "zhipu-openai"
+api_key = "${ZHIPU_API_KEY}"
+```

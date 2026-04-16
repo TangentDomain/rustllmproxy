@@ -17,7 +17,7 @@ rate_limit = 60
 # ─── Fallback 链 ──────────────────────────────────────────
 
 [fallback]
-# 旗舰模型
+# 旗舰模型：优先同级别降级，再跨级
 "glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6"]
 "glm-5v-turbo" = ["glm-5-turbo", "glm-5.1", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5"]
 "glm-5-turbo"  = ["glm-5v-turbo", "glm-5.1", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5"]
@@ -43,7 +43,7 @@ default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "MiniMa
 [[backends]]
 name = "zhipu-openai"
 url = "https://open.bigmodel.cn/api/coding/paas"
-api_key = "YOUR_ZHIPU_API_KEY_HERE"
+api_key = "${ZHIPU_API_KEY}"
 weight = 10
 models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
 timeout_secs = 300
@@ -52,9 +52,9 @@ protocol = "openai"
 
 # MiniMax后端1（两个key负载均衡）
 [[backends]]
-name = "minimax-openai-1"
+name = "minimax-coding-1"
 url = "https://api.minimaxi.com"
-api_key = "YOUR_MINIMAX_API_KEY_1_HERE"
+api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
 models = ["MiniMax-M2.7", "MiniMax-M2.5"]
 timeout_secs = 300
@@ -62,9 +62,9 @@ connect_timeout_secs = 8
 protocol = "openai"
 
 [[backends]]
-name = "minimax-openai-2"
+name = "minimax-coding-2"
 url = "https://api.minimaxi.com"
-api_key = "YOUR_MINIMAX_API_KEY_2_HERE"
+api_key = "${MINIMAX_API_KEY_2}"
 weight = 10
 models = ["MiniMax-M2.7", "MiniMax-M2.5"]
 timeout_secs = 300
@@ -77,18 +77,18 @@ protocol = "openai"
 [[backends]]
 name = "zhipu-anthropic"
 url = "https://open.bigmodel.cn/api/anthropic"
-api_key = "YOUR_ZHIPU_API_KEY_HERE"
+api_key = "${ZHIPU_API_KEY}"
 weight = 10
 models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
 timeout_secs = 300
 connect_timeout_secs = 10
 protocol = "anthropic"
 
-# MiniMax Anthropic后端1
+# MiniMax后端1（两个key负载均衡）
 [[backends]]
 name = "minimax-anthropic-1"
 url = "https://api.minimaxi.com/anthropic"
-api_key = "YOUR_MINIMAX_API_KEY_1_HERE"
+api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
 models = ["MiniMax-M2.7", "MiniMax-M2.5"]
 timeout_secs = 300
@@ -98,7 +98,7 @@ protocol = "anthropic"
 [[backends]]
 name = "minimax-anthropic-2"
 url = "https://api.minimaxi.com/anthropic"
-api_key = "YOUR_MINIMAX_API_KEY_2_HERE"
+api_key = "${MINIMAX_API_KEY_2}"
 weight = 10
 models = ["MiniMax-M2.7", "MiniMax-M2.5"]
 timeout_secs = 300

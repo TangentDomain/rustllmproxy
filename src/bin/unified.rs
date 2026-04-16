@@ -13,6 +13,9 @@ use axum::body::Body;
 
 #[tokio::main]
 async fn main() {
+    // Load .env file
+    dotenv::dotenv().ok();
+
     tracing_subscriber::fmt()
         .with_ansi(false)
         .init();
