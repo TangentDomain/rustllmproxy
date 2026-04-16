@@ -1,1 +1,22 @@
 target/
+
+# Environment and secrets
+.env
+.env.*
+*.pem
+*.key
+*.secret
+credentials.*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
