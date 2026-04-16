@@ -1,0 +1,69 @@
+type = "openai"
+retry = 2
+retry_delay_ms = 500
+
+[server]
+port = 8091
+timeout_secs = 300
+
+[auth]
+enabled = true
+
+[[auth.keys]]
+key = "sk-proxy-default"
+name = "default"
+rate_limit = 60
+
+# 每个模型可配置专属fallback链，请求的模型自动作为第一个
+# 未配置的模型走 default 兜底
+[fallback]
+# 旗舰模型：优先同级别降级，再跨级
+"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6"]
+"glm-5v-turbo" = ["glm-5-turbo", "glm-5.1", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5"]
+"glm-5-turbo"  = ["glm-5v-turbo", "glm-5.1", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5"]
+
+# 中端模型
+"glm-4.7"      = ["MiniMax-M2.7", "glm-4.6", "glm-4.5", "MiniMax-M2.5", "glm-4.5-air"]
+
+# 轻量模型
+"glm-4.6"      = ["glm-4.7", "MiniMax-M2.7", "MiniMax-M2.5", "glm-4.5"]
+"glm-4.5"      = ["glm-4.6", "glm-4.7", "MiniMax-M2.7", "MiniMax-M2.5"]
+"glm-4.5-air"  = ["glm-4.5", "glm-4.6", "glm-4.7"]
+
+# MiniMax模型
+"MiniMax-M2.7"  = ["MiniMax-M2.5", "glm-4.7", "glm-4.6", "glm-5v-turbo"]
+"MiniMax-M2.5"  = ["MiniMax-M2.7", "glm-4.7", "glm-4.6"]
+
+# 兜底
+default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "MiniMax-M2.7", "MiniMax-M2.5", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+
+# ─── 后端 ──────────────────────────────────────────────
+
+# 智谱后端：支持所有GLM模型
+[[backends]]
+name = "zhipu-openai"
+url = "https://open.bigmodel.cn/api/coding/paas"
+api_key = "YOUR_ZHIPU_API_KEY_HERE"
+weight = 10
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+timeout_secs = 300
+connect_timeout_secs = 10
+
+# MiniMax后端1（两个key负载均衡）
+[[backends]]
+name = "minimax-coding-1"
+url = "https://api.minimaxi.com"
+api_key = "YOUR_MINIMAX_API_KEY_1_HERE"
+weight = 10
+models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+timeout_secs = 300
+connect_timeout_secs = 8
+
+[[backends]]
+name = "minimax-coding-2"
+url = "https://api.minimaxi.com"
+api_key = "YOUR_MINIMAX_API_KEY_2_HERE"
+weight = 10
+models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+timeout_secs = 300
+connect_timeout_secs = 8

@@ -1,0 +1,25 @@
+[package]
+name = "llmproxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "openai-proxy"
+path = "src/bin/openai.rs"
+
+[[bin]]
+name = "anthropic-proxy"
+path = "src/bin/anthropic.rs"
+
+[dependencies]
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
