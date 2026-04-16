@@ -1,6 +1,6 @@
 use crate::config::Backend;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 
@@ -15,8 +15,9 @@ pub struct WeightedRoundRobin {
     backends: Vec<Arc<BackendState>>,
     retry: u32,
     retry_delay: Duration,
-    // 加权随机用到的累积权重前缀和（缓存在 Mutex 里，unhealthy 变化时重建）
-    selector: Mutex<Vec<(usize, u32)>>, // (backend_index, cumulative_weight)
+    // 加权随机用到的累积权重前缀和（缓存在 RwLock 里，unhealthy 变化时重建）
+    selector: RwLock<Vec<(usize, u32)>>, // (backend_index, cumulative_weight)
+    rand_counter: AtomicU64,
 }
 
 impl WeightedRoundRobin {
@@ -36,7 +37,8 @@ impl WeightedRoundRobin {
             backends: states,
             retry,
             retry_delay,
-            selector: Mutex::new(selector),
+            selector: RwLock::new(selector),
+            rand_counter: AtomicU64::new(0),
         }
     }
 
@@ -53,37 +55,27 @@ impl WeightedRoundRobin {
     }
 
     fn rebuild_selector(&self) {
-        let mut sel = self.selector.lock().unwrap();
+        let mut sel = self.selector.write().unwrap();
         *sel = Self::build_selector(&self.backends);
     }
 
     /// 加权随机选择健康后端
     pub fn select(&self) -> Result<Arc<BackendState>> {
-        let sel = self.selector.lock().unwrap();
+        let sel = self.selector.read().unwrap();
         if sel.is_empty() {
             return Err(anyhow!("无可用后端"));
         }
         let total = sel.last().map(|(_, w)| *w).unwrap_or(0);
         let r = self.next_random() % total as u64;
 
-        for &(idx, cum) in sel.iter() {
-            if r < cum as u64 {
-                return Ok(self.backends[idx].clone());
-            }
-        }
-        // fallback
-        Ok(self.backends[sel[0].0].clone())
+        let pos = sel.partition_point(|(_, cum)| *cum as u64 <= r);
+        let idx = if pos < sel.len() { sel[pos].0 } else { sel[0].0 };
+        Ok(self.backends[idx].clone())
     }
 
     /// 返回一个伪随机数（用于外部加权选择）
     pub fn next_random(&self) -> u64 {
-        use std::cell::Cell;
-        thread_local! { static COUNTER: Cell<u64> = const { Cell::new(0) }; }
-        COUNTER.with(|c| {
-            let v = c.get().wrapping_add(1);
-            c.set(v);
-            v
-        })
+        self.rand_counter.fetch_add(1, Ordering::Relaxed)
     }
 
     /// 带重试的选择

@@ -84,20 +84,14 @@ impl Proxy {
             }
         };
 
-        let mut body_json: serde_json::Value = match serde_json::from_slice(&bytes) {
-            Ok(v) => v,
-            Err(e) => {
-                error!("Invalid JSON body: {e}");
-                return (StatusCode::BAD_REQUEST, "Invalid JSON").into_response();
-            }
-        };
-
-        let model = body_json["model"].as_str().unwrap_or("").to_string();
+        // 延迟解析：只在需要修改 model 时才反序列化
+        let model = extract_model_from_json(&bytes);
         info!("Request model={model}, path={path}, protocol={:?}", protocol);
 
         let chain = self.config.get_fallback_chain(&model);
 
         // 按fallback链顺序尝试每个模型
+        let mut body_json: Option<serde_json::Value> = None;
         for try_model in &chain {
             let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
             if all_backends.is_empty() {
@@ -120,12 +114,15 @@ impl Proxy {
             // 每个健康后端只试1次，轮询而非重试同一个
             for selected in &healthy {
                 let resolved = selected.resolve_model(try_model);
-                // 只有 model 真正改变时才重新序列化
-                let body_bytes: Vec<u8> = if resolved == *try_model && body_json["model"].as_str() == Some(try_model.as_str()) {
+                // model 没变时直接用原始 bytes，跳过 JSON 序列化
+                let body_bytes: Vec<u8> = if resolved == *try_model && model == *try_model {
                     bytes.to_vec()
                 } else {
-                    body_json["model"] = serde_json::Value::String(resolved.clone());
-                    serde_json::to_vec(&body_json).unwrap_or_default()
+                    let json = body_json.get_or_insert_with(|| {
+                        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+                    });
+                    json["model"] = serde_json::Value::String(resolved.clone());
+                    serde_json::to_vec(json).unwrap_or_default()
                 };
 
                 match self.do_forward(&path, &parts.headers, &body_bytes, selected).await {
@@ -134,23 +131,19 @@ impl Proxy {
                         return resp;
                     }
                     Err(ForwardError::ClientError(status, body)) => {
-                        // 4xx 客户端错误：直接返回给调用方，不fallback
                         warn!("Client error from {}: {} - returning directly", selected.name, status);
                         return (status, body).into_response();
                     }
                     Err(ForwardError::RateLimited) => {
-                        // 429 Rate Limit：立即切换下一个key，不重试当前
                         warn!("{} rate limited (429), switching to next backend", selected.name);
                         continue;
                     }
                     Err(ForwardError::ServerErr(e)) => {
-                        // 5xx/超时：切换下一个后端
                         warn!("{} server error: {}, trying next", selected.name, e);
                         continue;
                     }
                 }
             }
-            // 该模型所有健康后端都失败，进入下一个模型
             warn!("All backends exhausted for model={try_model}, falling back");
         }
 
@@ -307,6 +300,15 @@ pub async fn auth_layer(
         key_name: api_key.name.clone(),
     });
     Ok(next.run(request).await)
+}
+
+/// 从 JSON bytes 中快速提取 "model" 字段，避免完整反序列化
+fn extract_model_from_json(bytes: &[u8]) -> String {
+    // 简单扫描 "model" key，比完整 serde_json::from_slice 快
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|v| v["model"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default()
 }
 
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
