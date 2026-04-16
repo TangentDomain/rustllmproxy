@@ -4,14 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "openai-proxy"
-path = "src/bin/openai.rs"
-
-[[bin]]
-name = "anthropic-proxy"
-path = "src/bin/anthropic.rs"
-
-[[bin]]
 name = "unified-proxy"
 path = "src/bin/unified.rs"
 

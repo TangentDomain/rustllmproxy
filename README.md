@@ -21,31 +21,16 @@ cargo build --release
 
 ### 运行
 
-**统一代理（推荐）：**
 ```bash
 start-unified-proxy.bat
 # 或
 cargo run --release --bin unified-proxy configs/unified.toml
 ```
-> 单个进程同时支持 OpenAI 和 Anthropic API，端口 8090
-
-**独立代理：**
-```bash
-# OpenAI 代理（端口 8091）
-start-proxy.bat
-cargo run --release --bin openai-proxy configs/openai.toml
-
-# Anthropic 代理（端口 8092）
-start-anthropic-proxy.bat
-cargo run --release --bin anthropic-proxy configs/anthropic.toml
-```
 
 ### 停止
 
 ```bash
-stop-unified-proxy.bat  # 停止统一代理
-stop-proxy.bat          # 停止 OpenAI 代理
-stop-anthropic-proxy.bat # 停止 Anthropic 代理
+stop-unified-proxy.bat
 ```
 
 ## 统一代理说明
@@ -116,24 +101,20 @@ rate_limit = 60  # 每分钟请求限制
 .
 ├── src/
 │   ├── bin/
-│   │   ├── openai.rs       # OpenAI 代理入口
-│   │   ├── anthropic.rs    # Anthropic 代理入口
-│   │   └── unified.rs      # 统一代理入口 ✨
+│   │   └── unified.rs      # 统一代理入口
 │   ├── balancer.rs         # 负载均衡器
 │   ├── config.rs           # 配置解析
 │   ├── middleware.rs       # 中间件（认证、限流）
 │   ├── proxy.rs            # 代理核心逻辑
 │   └── lib.rs
 ├── configs/
-│   ├── openai.toml         # OpenAI 代理配置
-│   ├── anthropic.toml      # Anthropic 代理配置
-│   └── unified.toml        # 统一代理配置 ✨
+│   └── unified.toml        # 统一代理配置
 └── Cargo.toml
 ```
 
 ## 使用示例
 
-### 统一代理示例
+## 使用示例
 
 ```bash
 # OpenAI 兼容请求
@@ -149,25 +130,8 @@ curl http://localhost:8090/anthropic/v1/messages \
   -d '{"model":"claude-3-sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
-### 独立代理示例
-
-```bash
-# OpenAI 代理 (端口 8091)
-curl http://localhost:8091/v1/chat/completions \
-  -H "Authorization: Bearer sk-proxy-default" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
-
-# Anthropic 代理 (端口 8092)
-curl http://localhost:8092/v1/messages \
-  -H "x-api-key: sk-proxy-default" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"claude-3-sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
-```
-
 ## 注意事项
 
-- 首次运行前需修改 `configs/*.toml` 中的 API Key
+- 首次运行前需修改 `configs/unified.toml` 中的 API Key
 - 确保后端服务可访问
 - Windows 下建议使用 `.bat` 脚本启动
-- 推荐使用统一代理以简化部署
