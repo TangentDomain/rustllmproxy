@@ -47,9 +47,13 @@ pub struct Backend {
     pub connect_timeout_secs: u64,
     #[serde(default)]
     pub model_mappings: HashMap<String, String>,
+    /// Protocol type: "openai" or "anthropic"
+    #[serde(default = "default_protocol")]
+    pub protocol: String,
 }
 
 fn default_connect_timeout() -> u64 { 5 }
+fn default_protocol() -> String { "openai".to_string() }
 
 impl Backend {
     /// 判断该后端是否支持某个模型（直接支持或通过映射）

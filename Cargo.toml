@@ -11,6 +11,10 @@ path = "src/bin/openai.rs"
 name = "anthropic-proxy"
 path = "src/bin/anthropic.rs"
 
+[[bin]]
+name = "unified-proxy"
+path = "src/bin/unified.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }

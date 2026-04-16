@@ -4,6 +4,7 @@
 
 ## 功能特性
 
+- **统一代理**：单个进程同时支持 OpenAI 和 Anthropic API
 - **OpenAI/Anthropic 兼容 API**：完全兼容 OpenAI 和 Anthropic API 规范
 - **多后端负载均衡**：支持配置多个后端服务，按权重分配请求
 - **智能故障转移**：模型级别的 fallback 链，自动降级到可用模型
@@ -20,25 +21,53 @@ cargo build --release
 
 ### 运行
 
-**OpenAI 代理（端口 8091）：**
+**统一代理（推荐）：**
 ```bash
-start-proxy.bat
+start-unified-proxy.bat
 # 或
-cargo run --release --bin openai-proxy configs/openai.toml
+cargo run --release --bin unified-proxy configs/unified.toml
 ```
+> 单个进程同时支持 OpenAI 和 Anthropic API，端口 8090
 
-**Anthropic 代理（端口 8092）：**
+**独立代理：**
 ```bash
+# OpenAI 代理（端口 8091）
+start-proxy.bat
+cargo run --release --bin openai-proxy configs/openai.toml
+
+# Anthropic 代理（端口 8092）
 start-anthropic-proxy.bat
-# 或
 cargo run --release --bin anthropic-proxy configs/anthropic.toml
 ```
 
 ### 停止
 
 ```bash
+stop-unified-proxy.bat  # 停止统一代理
 stop-proxy.bat          # 停止 OpenAI 代理
 stop-anthropic-proxy.bat # 停止 Anthropic 代理
+```
+
+## 统一代理说明
+
+统一代理自动根据 API 路径识别请求类型：
+
+- **OpenAI 格式**：`/v1/chat/completions`, `/v1/completions`, `/v1/models`
+- **Anthropic 格式**：`/v1/messages`
+
+配置文件中每个后端需指定 `protocol` 字段：
+```toml
+[[backends]]
+name = "openai-backend"
+protocol = "openai"
+url = "https://api.example.com"
+api_key = "YOUR_API_KEY"
+
+[[backends]]
+name = "anthropic-backend"
+protocol = "anthropic"
+url = "https://api.example.com/anthropic"
+api_key = "YOUR_API_KEY"
 ```
 
 ## 配置说明
@@ -56,6 +85,7 @@ weight = 10              # 负载均衡权重
 models = ["model-1", "model-2"]
 timeout_secs = 300
 connect_timeout_secs = 10
+protocol = "openai"      # "openai" 或 "anthropic"
 ```
 
 ### Fallback 链
@@ -87,7 +117,8 @@ rate_limit = 60  # 每分钟请求限制
 ├── src/
 │   ├── bin/
 │   │   ├── openai.rs       # OpenAI 代理入口
-│   │   └── anthropic.rs    # Anthropic 代理入口
+│   │   ├── anthropic.rs    # Anthropic 代理入口
+│   │   └── unified.rs      # 统一代理入口 ✨
 │   ├── balancer.rs         # 负载均衡器
 │   ├── config.rs           # 配置解析
 │   ├── middleware.rs       # 中间件（认证、限流）
@@ -95,20 +126,39 @@ rate_limit = 60  # 每分钟请求限制
 │   └── lib.rs
 ├── configs/
 │   ├── openai.toml         # OpenAI 代理配置
-│   └── anthropic.toml      # Anthropic 代理配置
+│   ├── anthropic.toml      # Anthropic 代理配置
+│   └── unified.toml        # 统一代理配置 ✨
 └── Cargo.toml
 ```
 
 ## 使用示例
 
+### 统一代理示例
+
 ```bash
 # OpenAI 兼容请求
-curl http://localhost:8091/v1/chat/completions \
+curl http://localhost:8090/v1/chat/completions \
   -H "Authorization: Bearer sk-proxy-default" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
 
 # Anthropic 兼容请求
+curl http://localhost:8090/v1/messages \
+  -H "x-api-key: sk-proxy-default" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-3-sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### 独立代理示例
+
+```bash
+# OpenAI 代理 (端口 8091)
+curl http://localhost:8091/v1/chat/completions \
+  -H "Authorization: Bearer sk-proxy-default" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}'
+
+# Anthropic 代理 (端口 8092)
 curl http://localhost:8092/v1/messages \
   -H "x-api-key: sk-proxy-default" \
   -H "Content-Type: application/json" \
@@ -120,3 +170,4 @@ curl http://localhost:8092/v1/messages \
 - 首次运行前需修改 `configs/*.toml` 中的 API Key
 - 确保后端服务可访问
 - Windows 下建议使用 `.bat` 脚本启动
+- 推荐使用统一代理以简化部署

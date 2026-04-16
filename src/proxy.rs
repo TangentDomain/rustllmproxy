@@ -156,15 +156,15 @@ impl Proxy {
         body: &[u8],
         backend: &Backend,
     ) -> Result<Response<Body>, ForwardError> {
-        // Rewrite /v1/ -> /v4/ 仅对 OpenAI 类型 + bigmodel 域名（coding API）
+        // Rewrite /v1/ -> /v4/ 仅对 OpenAI 协议 + bigmodel 域名（coding API）
         // Anthropic 格式保持原始路径
-        let forward_path = if self.config.r#type == "openai" && backend.url.contains("bigmodel") {
+        let forward_path = if backend.protocol == "openai" && backend.url.contains("bigmodel") {
             path.replacen("/v1/", "/v4/", 1)
         } else {
             path.to_string()
         };
         let url = format!("{}{}", backend.url.trim_end_matches('/'), forward_path);
-        info!("Forwarding to {} (backend={})", url, backend.name);
+        info!("Forwarding to {} (backend={}, protocol={})", url, backend.name, backend.protocol);
 
         // 使用总超时（后端配置的timeout_secs）
         let total_timeout = Duration::from_secs(backend.timeout_secs);
@@ -174,7 +174,7 @@ impl Proxy {
             .timeout(total_timeout)
             .body(body.to_vec());
 
-        match self.config.r#type.as_str() {
+        match backend.protocol.as_str() {
             "anthropic" => {
                 req_builder = req_builder
                     .header("x-api-key", &backend.api_key)
