@@ -1,4 +1,5 @@
 use crate::config::Backend;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -18,6 +19,7 @@ pub struct WeightedRoundRobin {
     // 加权随机用到的累积权重前缀和（缓存在 RwLock 里，unhealthy 变化时重建）
     selector: RwLock<Vec<(usize, u32)>>, // (backend_index, cumulative_weight)
     rand_counter: AtomicU64,
+    name_index: HashMap<String, usize>, // name → backends Vec index，O(1) 健康查找
 }
 
 impl WeightedRoundRobin {
@@ -32,6 +34,11 @@ impl WeightedRoundRobin {
                 })
             })
             .collect();
+        let name_index: HashMap<String, usize> = states
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.backend.name.clone(), i))
+            .collect();
         let selector = Self::build_selector(&states);
         Self {
             backends: states,
@@ -39,6 +46,7 @@ impl WeightedRoundRobin {
             retry_delay,
             selector: RwLock::new(selector),
             rand_counter: AtomicU64::new(0),
+            name_index,
         }
     }
 
@@ -117,6 +125,13 @@ impl WeightedRoundRobin {
 
     pub fn all_backends(&self) -> Vec<Arc<BackendState>> {
         self.backends.clone()
+    }
+
+    /// O(1) 按名称查询后端健康状态
+    pub fn is_healthy_by_name(&self, name: &str) -> bool {
+        self.name_index.get(name).map_or(false, |&idx| {
+            self.backends[idx].healthy.load(Ordering::Relaxed)
+        })
     }
 
     /// 启动后台健康检查（已禁用 - 不同 provider API 格式不统一）

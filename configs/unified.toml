@@ -12,7 +12,7 @@ enabled = true
 [[auth.keys]]
 key = "sk-proxy-default"
 name = "default"
-rate_limit = 60
+rate_limit = 999
 
 # ─── Fallback 链 ──────────────────────────────────────────
 

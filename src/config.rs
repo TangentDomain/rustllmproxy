@@ -50,6 +50,9 @@ pub struct Backend {
     /// Protocol type: "openai" or "anthropic"
     #[serde(default = "default_protocol")]
     pub protocol: String,
+    /// 预计算的认证 header（启动时生成，跳过反序列化）
+    #[serde(skip)]
+    pub auth_header: String,
 }
 
 fn default_connect_timeout() -> u64 { 5 }
@@ -58,7 +61,7 @@ fn default_protocol() -> String { "openai".to_string() }
 impl Backend {
     /// 判断该后端是否支持某个模型（直接支持或通过映射）
     pub fn supports_model(&self, model: &str) -> bool {
-        self.models.contains(&model.to_string()) || self.model_mappings.contains_key(model)
+        self.models.iter().any(|m| m == model) || self.model_mappings.contains_key(model)
     }
 
     /// 获取该后端的实际模型名（有映射则转换，否则原样返回）
@@ -75,6 +78,10 @@ impl Config {
             .with_context(|| format!("解析配置文件失败: {path}"))?;
         for b in &mut cfg.backends {
             b.api_key = expand_env(&b.api_key);
+            b.auth_header = match b.protocol.as_str() {
+                "anthropic" => b.api_key.clone(),
+                _ => format!("Bearer {}", b.api_key),
+            };
         }
         tracing::info!("配置加载成功: {path} (类型={}, 后端数={})", cfg.r#type, cfg.backends.len());
         Ok(cfg)
@@ -161,6 +168,8 @@ mod tests {
             timeout_secs: 30,
             connect_timeout_secs: 5,
             model_mappings: HashMap::new(),
+            protocol: "openai".to_string(),
+            auth_header: format!("Bearer key-{name}"),
         }
     }
 
@@ -178,6 +187,8 @@ mod tests {
             timeout_secs: 30,
             connect_timeout_secs: 5,
             model_mappings: m,
+            protocol: "openai".to_string(),
+            auth_header: format!("Bearer key-{name}"),
         }
     }
 
@@ -292,13 +303,13 @@ mod tests {
             make_backend("minimax", &["MiniMax-M2.7"]),
         ]);
 
-        assert_eq!(cfg.find_backends_for_model("glm-5.1").len(), 1);
-        assert_eq!(cfg.find_backends_for_model("glm-5.1")[0].name, "zhipu");
+        assert_eq!(cfg.find_backends_for_model("glm-5.1", None).len(), 1);
+        assert_eq!(cfg.find_backends_for_model("glm-5.1", None)[0].name, "zhipu");
 
-        assert_eq!(cfg.find_backends_for_model("MiniMax-M2.7").len(), 1);
-        assert_eq!(cfg.find_backends_for_model("MiniMax-M2.7")[0].name, "minimax");
+        assert_eq!(cfg.find_backends_for_model("MiniMax-M2.7", None).len(), 1);
+        assert_eq!(cfg.find_backends_for_model("MiniMax-M2.7", None)[0].name, "minimax");
 
-        assert!(cfg.find_backends_for_model("nonexistent").is_empty());
+        assert!(cfg.find_backends_for_model("nonexistent", None).is_empty());
     }
 
     #[test]
@@ -308,7 +319,7 @@ mod tests {
             make_backend("minimax", &["MiniMax-M2.7"]),
         ]);
 
-        let backends = cfg.find_backends_for_model("MiniMax-M2.7");
+        let backends = cfg.find_backends_for_model("MiniMax-M2.7", None);
         assert_eq!(backends.len(), 2);
         let names: Vec<&str> = backends.iter().map(|b| b.name.as_str()).collect();
         assert!(names.contains(&"zhipu"));
@@ -336,15 +347,15 @@ mod tests {
         assert_eq!(chain, vec!["glm-5.1", "glm-5v-turbo", "MiniMax-M2.7", "glm-4.7"]);
 
         // glm-5.1 → zhipu
-        assert_eq!(cfg.find_backends_for_model("glm-5.1").len(), 1);
-        assert_eq!(cfg.find_backends_for_model("glm-5.1")[0].name, "zhipu");
+        assert_eq!(cfg.find_backends_for_model("glm-5.1", None).len(), 1);
+        assert_eq!(cfg.find_backends_for_model("glm-5.1", None)[0].name, "zhipu");
 
         // glm-5v-turbo → default链，自身打头
         let chain2 = cfg.get_fallback_chain("glm-5v-turbo");
         assert_eq!(chain2[0], "glm-5v-turbo");
 
         // M2.7 → minimax组 (2个)
-        let mm_backends = cfg.find_backends_for_model("MiniMax-M2.7");
+        let mm_backends = cfg.find_backends_for_model("MiniMax-M2.7", None);
         assert_eq!(mm_backends.len(), 2);
         assert!(mm_backends.iter().all(|b| b.name.starts_with("minimax")));
 
@@ -354,7 +365,7 @@ mod tests {
 
         // 验证完整路由过程
         for (i, m) in chain.iter().enumerate() {
-            let backends = cfg.find_backends_for_model(m);
+            let backends = cfg.find_backends_for_model(m, None);
             match i {
                 0 => { assert_eq!(backends.len(), 1); assert_eq!(backends[0].name, "zhipu"); }
                 1 => { assert_eq!(backends.len(), 1); assert_eq!(backends[0].name, "zhipu"); }
@@ -385,7 +396,7 @@ mod tests {
 
         let expected = ["zhipu", "minimax", "zhipu", "minimax"];
         for (i, m) in chain.iter().enumerate() {
-            let backends = cfg.find_backends_for_model(m);
+            let backends = cfg.find_backends_for_model(m, None);
             assert_eq!(
                 backends[0].name,
                 expected[i],
@@ -416,7 +427,7 @@ mod tests {
         assert_eq!(chain, vec!["glm-5.1", "glm-4.7"]);
 
         // glm-5.1 只有 1 个后端，如果它超时应该立即切换
-        let backends = cfg.find_backends_for_model("glm-5.1");
+        let backends = cfg.find_backends_for_model("glm-5.1", None);
         assert_eq!(backends.len(), 1); // 单点故障
     }
 
@@ -429,7 +440,7 @@ mod tests {
         ]);
 
         // MiniMax-M2.7 有 2 个后端
-        let backends = cfg.find_backends_for_model("MiniMax-M2.7");
+        let backends = cfg.find_backends_for_model("MiniMax-M2.7", None);
         assert_eq!(backends.len(), 2);
 
         // 当前实现: minimax-1 返回429后会重试2次
@@ -464,7 +475,7 @@ mod tests {
             make_backend("backend", &["glm-5.1"]),
         ]);
 
-        let backends = cfg.find_backends_for_model("glm-5.1");
+        let backends = cfg.find_backends_for_model("glm-5.1", None);
         assert_eq!(backends.len(), 1);
         // 400 错误应该直接返回给客户端，不应该fallback
     }
@@ -478,7 +489,7 @@ mod tests {
             make_backend("backend-3", &["MiniMax-M2.7"]),
         ]);
 
-        let backends = cfg.find_backends_for_model("MiniMax-M2.7");
+        let backends = cfg.find_backends_for_model("MiniMax-M2.7", None);
         assert_eq!(backends.len(), 3);
 
         // 当前实现: 3个后端加权随机

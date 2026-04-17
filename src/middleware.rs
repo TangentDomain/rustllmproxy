@@ -5,8 +5,9 @@ use axum::{
     response::Response,
 };
 use crate::config::Config;
-use dashmap::{DashMap, Entry};
+use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 /// 每个key的限流状态
@@ -24,6 +25,7 @@ impl Default for RateLimitEntry {
 #[derive(Default)]
 pub struct RateLimiter {
     entries: DashMap<String, RateLimitEntry>,
+    check_count: AtomicU64,
 }
 
 impl RateLimiter {
@@ -34,21 +36,25 @@ impl RateLimiter {
     /// 返回 true 表示允许，false 表示被限流
     pub fn check(&self, key: &str, limit: u32) -> bool {
         let now = Instant::now();
-        match self.entries.entry(key.to_string()) {
-            Entry::Occupied(mut e) => {
-                let entry = e.get_mut();
-                if now.duration_since(entry.window_start).as_secs() >= 60 {
-                    entry.count = 0;
-                    entry.window_start = now;
-                }
-                entry.count += 1;
-                entry.count <= limit
-            }
-            Entry::Vacant(e) => {
-                e.insert(RateLimitEntry { count: 1, window_start: now });
-                true
-            }
+
+        // 惰性清理：每 256 次请求清理一次过期条目
+        if self.check_count.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
+            self.entries.retain(|_, e| now.duration_since(e.window_start).as_secs() < 120);
         }
+
+        // 先无分配查找已存在的 key
+        if let Some(mut e) = self.entries.get_mut(key) {
+            let entry = e.value_mut();
+            if now.duration_since(entry.window_start).as_secs() >= 60 {
+                entry.count = 0;
+                entry.window_start = now;
+            }
+            entry.count += 1;
+            return entry.count <= limit;
+        }
+        // 不存在才分配并插入
+        self.entries.insert(key.to_string(), RateLimitEntry { count: 1, window_start: now });
+        true
     }
 }
 

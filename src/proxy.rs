@@ -39,9 +39,10 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(config: Arc<Config>, balancer: Arc<WeightedRoundRobin>) -> Self {
         let client = Client::builder()
-            .pool_max_idle_per_host(20)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(50)
+            .pool_idle_timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(3))
+            .http2_prior_knowledge()
             .build()
             .expect("failed to build reqwest client");
         Self { config, balancer, limiter: Arc::new(RateLimiter::new()), client }
@@ -55,10 +56,9 @@ impl Proxy {
         &self.config
     }
 
-    /// 检查后端是否健康（快速查询，不锁）
+    /// 检查后端是否健康（O(1) 查找）
     fn is_healthy(&self, b: &Backend) -> bool {
-        self.balancer.all_backends().iter()
-            .any(|bs| bs.backend.name == b.name && bs.healthy.load(std::sync::atomic::Ordering::Relaxed))
+        self.balancer.is_healthy_by_name(&b.name)
     }
 
     /// Main proxy handler: follow fallback chain, route each model to matching backends.
@@ -91,7 +91,7 @@ impl Proxy {
         let chain = self.config.get_fallback_chain(&model);
 
         // 按fallback链顺序尝试每个模型
-        let mut body_json: Option<serde_json::Value> = None;
+        let original_model = &model;
         for try_model in &chain {
             let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
             if all_backends.is_empty() {
@@ -114,18 +114,15 @@ impl Proxy {
             // 每个健康后端只试1次，轮询而非重试同一个
             for selected in &healthy {
                 let resolved = selected.resolve_model(try_model);
-                // model 没变时直接用原始 bytes，跳过 JSON 序列化
-                let body_bytes: Vec<u8> = if resolved == *try_model && model == *try_model {
+                // model 未变时用 Bytes::clone（Arc 引用计数+1，零数据拷贝）
+                // model 变更时用字节级 patch 替代完整反序列化
+                let body_bytes: Vec<u8> = if resolved == *try_model && *original_model == *try_model {
                     bytes.to_vec()
                 } else {
-                    let json = body_json.get_or_insert_with(|| {
-                        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
-                    });
-                    json["model"] = serde_json::Value::String(resolved.clone());
-                    serde_json::to_vec(json).unwrap_or_default()
+                    patch_json_model(&bytes, original_model, &resolved)
                 };
 
-                match self.do_forward(&path, &parts.headers, &body_bytes, selected).await {
+                match self.do_forward(&path, &parts.headers, body_bytes, selected).await {
                     Ok(resp) => {
                         info!("Success: {} -> {} via {}", try_model, resolved, selected.name);
                         return resp;
@@ -156,7 +153,7 @@ impl Proxy {
         &self,
         path: &str,
         orig_headers: &HeaderMap,
-        body: &[u8],
+        body: Vec<u8>,
         backend: &Backend,
     ) -> Result<Response<Body>, ForwardError> {
         // Rewrite /v1/ -> /v4/ 仅对 OpenAI 协议 + bigmodel 域名（coding API）
@@ -175,8 +172,9 @@ impl Proxy {
         let mut req_builder = self.client
             .post(&url)
             .timeout(total_timeout)
-            .body(body.to_vec());
+            .body(body);
 
+        // 使用预计算的 auth_header（启动时生成，避免每次 format! 分配）
         match backend.protocol.as_str() {
             "anthropic" => {
                 req_builder = req_builder
@@ -185,7 +183,7 @@ impl Proxy {
             }
             _ => {
                 req_builder = req_builder
-                    .header(header::AUTHORIZATION, format!("Bearer {}", backend.api_key));
+                    .header(header::AUTHORIZATION, &backend.auth_header);
             }
         }
 
@@ -302,13 +300,57 @@ pub async fn auth_layer(
     Ok(next.run(request).await)
 }
 
-/// 从 JSON bytes 中快速提取 "model" 字段，避免完整反序列化
+/// 从 JSON bytes 中快速提取 "model" 字段值（手动扫描，避免完整反序列化）
 fn extract_model_from_json(bytes: &[u8]) -> String {
-    // 简单扫描 "model" key，比完整 serde_json::from_slice 快
-    serde_json::from_slice::<serde_json::Value>(bytes)
-        .ok()
-        .and_then(|v| v["model"].as_str().map(|s| s.to_string()))
-        .unwrap_or_default()
+    const PATTERN: &[u8] = b"\"model\"";
+    if let Some(pos) = bytes.windows(PATTERN.len()).position(|w| w == PATTERN) {
+        let after_key = &bytes[pos + PATTERN.len()..];
+        // 跳过空白和冒号
+        let after_colon = skip_whitespace(after_key);
+        if !after_colon.is_empty() && after_colon[0] == b':' {
+            let after_colon = skip_whitespace(&after_colon[1..]);
+            if !after_colon.is_empty() && after_colon[0] == b'"' {
+                if let Some(end) = after_colon[1..].iter().position(|&c| c == b'"') {
+                    return String::from_utf8_lossy(&after_colon[1..1 + end]).into_owned();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
+/// 跳过空白字符（空格、tab、换行、回车）
+fn skip_whitespace(s: &[u8]) -> &[u8] {
+    s.iter().position(|&c| c != b' ' && c != b'\t' && c != b'\n' && c != b'\r')
+        .map_or(&[], |i| &s[i..])
+}
+
+/// 字节级替换 JSON 中的 model 字段值，避免完整反序列化+序列化
+fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
+    // 搜索 "model":"old_value" 并替换为 "model":"new_value"
+    let pattern = format!("\"model\":\"{old_model}\"");
+    let replacement = format!("\"model\":\"{new_model}\"");
+    let p = pattern.as_bytes();
+    let r = replacement.as_bytes();
+    // 手动字节替换
+    let mut result = Vec::with_capacity(bytes.len() + r.len().saturating_sub(p.len()));
+    let mut i = 0;
+    while i <= bytes.len().saturating_sub(p.len()) {
+        if bytes[i..].starts_with(p) {
+            result.extend_from_slice(r);
+            i += p.len();
+        } else {
+            result.push(bytes[i]);
+            i += 1;
+        }
+    }
+    result.extend_from_slice(&bytes[i..]);
+    // 如果没替换到或 model 相同，直接返回原始 bytes 的拷贝
+    if result == bytes || old_model == new_model {
+        bytes.to_vec()
+    } else {
+        result
+    }
 }
 
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
@@ -377,6 +419,7 @@ async fn backends_handler(State(proxy): State<Arc<Proxy>>) -> axum::Json<serde_j
             "name": b.backend.name,
             "url": b.backend.url,
             "healthy": b.healthy.load(std::sync::atomic::Ordering::Relaxed),
+            "fail_count": b.fail_count.load(std::sync::atomic::Ordering::Relaxed),
         })
     }).collect();
     axum::Json(serde_json::json!({"backends": backends}))
