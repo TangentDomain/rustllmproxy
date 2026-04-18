@@ -1,0 +1,29 @@
+type = "unified"
+retry = 2
+retry_delay_ms = 100
+
+[server]
+port = 8090
+timeout_secs = 5
+
+[auth]
+enabled = true
+
+[[auth.keys]]
+key = "sk-perf-test"
+name = "perf-test"
+rate_limit = 10000
+
+[fallback]
+default = ["glm-4.7"]
+
+# Mock 后端（20ms 延迟）
+[[backends]]
+name = "mock-fast"
+url = "http://127.0.0.1:8765"
+api_key = "sk-test"
+weight = 10
+models = ["glm-4.7"]
+timeout_secs = 5
+connect_timeout_secs = 1
+protocol = "openai"

@@ -42,7 +42,6 @@ impl Proxy {
             .pool_max_idle_per_host(50)
             .pool_idle_timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(3))
-            .http2_prior_knowledge()
             .build()
             .expect("failed to build reqwest client");
         Self { config, balancer, limiter: Arc::new(RateLimiter::new()), client }
