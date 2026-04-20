@@ -11,6 +11,10 @@ path = "src/bin/unified.rs"
 name = "mock_llm_server"
 path = "tests/mock_llm_server.rs"
 
+[[bin]]
+name = "log_analyzer"
+path = "src/bin/log_analyzer.rs"
+
 [dependencies]
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -35,6 +39,7 @@ async-stream = "0.3"
 futures = "0.3"
 memchr = "2"
 parking_lot = "0.12"
+chrono = "0.4"
 
 [dev-dependencies]
 alloc_counter = "0.0"
