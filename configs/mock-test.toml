@@ -1,0 +1,30 @@
+type = "unified"
+retry = 1
+retry_delay_ms = 100
+
+[auth]
+enabled = false
+
+[[auth.keys]]
+key = "mock"
+name = "mock"
+rate_limit = 9999
+
+[server]
+port = 8092
+timeout_secs = 10
+log_dir = "logs-mock"
+
+
+[fallback]
+"mock-model" = []
+
+[[backends]]
+name = "mock-server"
+url = "http://127.0.0.1:8766"
+api_key = "mock"
+weight = 10
+models = ["mock-model"]
+timeout_secs = 5
+connect_timeout_secs = 2
+protocol = "openai"

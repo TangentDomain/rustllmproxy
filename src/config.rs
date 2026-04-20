@@ -198,7 +198,7 @@ mod tests {
 
     fn make_config(fallback: HashMap<String, Vec<String>>, backends: Vec<Backend>) -> Config {
         Config {
-            server: ServerConfig { port: 8091, timeout_secs: 30 },
+            server: ServerConfig { port: 8091, timeout_secs: 30, log_dir: "logs".to_string() },
             r#type: "openai".to_string(),
             auth: AuthConfig { enabled: false, keys: vec![] },
             backends,

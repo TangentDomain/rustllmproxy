@@ -1,7 +1,8 @@
 use crate::config::Backend;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 
@@ -63,13 +64,13 @@ impl WeightedRoundRobin {
     }
 
     fn rebuild_selector(&self) {
-        let mut sel = self.selector.write().unwrap();
+        let mut sel = self.selector.write();
         *sel = Self::build_selector(&self.backends);
     }
 
     /// 加权随机选择健康后端
     pub fn select(&self) -> Result<Arc<BackendState>> {
-        let sel = self.selector.read().unwrap();
+        let sel = self.selector.read();
         if sel.is_empty() {
             return Err(anyhow!("无可用后端"));
         }

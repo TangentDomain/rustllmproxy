@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, Request, Response, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
+use bytes::Bytes;
 use reqwest::Client;
 use tokio::signal;
 use tower_http::cors::CorsLayer;
@@ -110,10 +111,11 @@ impl Proxy {
 
             for selected in &healthy {
                 let resolved = selected.resolve_model(try_model);
-                let body_bytes: Vec<u8> = if resolved == *try_model && *original_model == *try_model {
-                    bytes.to_vec()
+                // Use Bytes directly when model unchanged (zero-copy via refcount), otherwise patch
+                let body_bytes: Bytes = if resolved == *try_model && *original_model == *try_model {
+                    bytes.clone() // Bytes::clone is O(1) refcount increment
                 } else {
-                    patch_json_model(&bytes, original_model, &resolved)
+                    Bytes::from(patch_json_model(&bytes, original_model, &resolved))
                 };
 
                 match self.do_forward(&path, &parts.headers, body_bytes, selected).await {
@@ -123,7 +125,6 @@ impl Proxy {
                             try_model, resolved, selected.name, ttfb_ms, body_size, is_stream);
 
                         if is_stream {
-                            // 包裹 stream，完成后打印完整指标
                             let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start);
                             let mut resp = Response::new(new_body);
                             resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
@@ -166,7 +167,7 @@ impl Proxy {
         &self,
         path: &str,
         orig_headers: &HeaderMap,
-        body: Vec<u8>,
+        body: Bytes,
         backend: &Backend,
     ) -> Result<(Response<Body>, Duration, bool), ForwardError> {
         // Rewrite /v1/ -> /v4/ 仅对 OpenAI 协议 + bigmodel 域名（coding API）
@@ -326,17 +327,22 @@ pub async fn auth_layer(
 }
 
 /// 从 JSON bytes 中快速提取 "model" 字段值（手动扫描，避免完整反序列化）
+/// 优化：只扫描前 2KB（model 字段始终在 JSON 开头附近）
 fn extract_model_from_json(bytes: &[u8]) -> String {
     const PATTERN: &[u8] = b"\"model\"";
-    if let Some(pos) = bytes.windows(PATTERN.len()).position(|w| w == PATTERN) {
+    // model 字段始终在 JSON 开头附近，只扫描前 2KB
+    let scan_range = &bytes[..bytes.len().min(2048)];
+    if let Some(pos) = scan_range.windows(PATTERN.len()).position(|w| w == PATTERN) {
         let after_key = &bytes[pos + PATTERN.len()..];
-        // 跳过空白和冒号
         let after_colon = skip_whitespace(after_key);
         if !after_colon.is_empty() && after_colon[0] == b':' {
             let after_colon = skip_whitespace(&after_colon[1..]);
             if !after_colon.is_empty() && after_colon[0] == b'"' {
                 if let Some(end) = after_colon[1..].iter().position(|&c| c == b'"') {
-                    return String::from_utf8_lossy(&after_colon[1..1 + end]).into_owned();
+                    let model_bytes = &after_colon[1..1 + end];
+                    return std::str::from_utf8(model_bytes)
+                        .map(|s| s.to_owned())
+                        .unwrap_or_default();
                 }
             }
         }
@@ -350,32 +356,27 @@ fn skip_whitespace(s: &[u8]) -> &[u8] {
         .map_or(&[], |i| &s[i..])
 }
 
-/// 字节级替换 JSON 中的 model 字段值，避免完整反序列化+序列化
+/// 字节级替换 JSON 中的 model 字段值，避免完整反序列化+序列化。
+/// 优化：先找匹配位置，然后一次性构建结果，避免逐字节 push。
 fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
-    // 搜索 "model":"old_value" 并替换为 "model":"new_value"
+    if old_model == new_model {
+        return bytes.to_vec();
+    }
     let pattern = format!("\"model\":\"{old_model}\"");
-    let replacement = format!("\"model\":\"{new_model}\"");
     let p = pattern.as_bytes();
+    // Find the match position first
+    let match_pos = bytes.windows(p.len()).position(|w| w == p);
+    let Some(match_pos) = match_pos else {
+        return bytes.to_vec();
+    };
+    // Build result: prefix + replacement + suffix (single allocation)
+    let replacement = format!("\"model\":\"{new_model}\"");
     let r = replacement.as_bytes();
-    // 手动字节替换
-    let mut result = Vec::with_capacity(bytes.len() + r.len().saturating_sub(p.len()));
-    let mut i = 0;
-    while i <= bytes.len().saturating_sub(p.len()) {
-        if bytes[i..].starts_with(p) {
-            result.extend_from_slice(r);
-            i += p.len();
-        } else {
-            result.push(bytes[i]);
-            i += 1;
-        }
-    }
-    result.extend_from_slice(&bytes[i..]);
-    // 如果没替换到或 model 相同，直接返回原始 bytes 的拷贝
-    if result == bytes || old_model == new_model {
-        bytes.to_vec()
-    } else {
-        result
-    }
+    let mut result = Vec::with_capacity(match_pos + r.len() + (bytes.len() - match_pos - p.len()));
+    result.extend_from_slice(&bytes[..match_pos]);
+    result.extend_from_slice(r);
+    result.extend_from_slice(&bytes[match_pos + p.len()..]);
+    result
 }
 
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
@@ -455,7 +456,8 @@ async fn shutdown_signal() {
     info!("Shutting down...");
 }
 
-/// 包裹 stream body，追踪 token 数量，完成后打印完整性能指标
+/// 包裹 stream body，追踪 token 数量，完成后打印完整性能指标。
+/// 优化：使用 copy_in_place 压缩 + Bytes 零拷贝转发 + 预分配缓冲区。
 fn instrument_stream(
     body: Body,
     model: String,
@@ -464,7 +466,7 @@ fn instrument_stream(
     ttfb: Duration,
     t_start: Instant,
 ) -> (Body, tokio::task::JoinHandle<()>) {
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let done = tokio::spawn(async move {
         use http_body_util::BodyExt;
@@ -472,7 +474,8 @@ fn instrument_stream(
         let mut body = std::pin::pin!(body);
         let mut output_tokens: u32 = 0;
         let mut first_text_token: Option<Instant> = None;
-        let mut buffer = String::new();
+        // Pre-allocate with generous capacity to avoid re-allocations during streaming
+        let mut buffer = Vec::with_capacity(8192);
 
         while let Some(frame_result) = body.frame().await {
             let frame = match frame_result {
@@ -484,24 +487,44 @@ fn instrument_stream(
             };
 
             if let Some(data) = frame.into_data().ok() {
-                let text = String::from_utf8_lossy(&data);
-                buffer.push_str(&text);
+                buffer.extend_from_slice(&data);
 
-                while let Some(pos) = buffer.find('\n') {
-                    let line = buffer[..pos].to_string();
-                    buffer = buffer[pos + 1..].to_string();
+                // Scan for complete SSE lines using memchr for SIMD-accelerated newline search
+                let mut newline_idx = 0;
+                while newline_idx < buffer.len() {
+                    let remaining = &buffer[newline_idx..];
+                    match memchr::memchr(b'\n', remaining) {
+                        Some(pos) => {
+                            let line = &buffer[newline_idx..newline_idx + pos];
+                            newline_idx += pos + 1;
 
-                    if let Some(sse_data) = line.strip_prefix("data: ") {
-                        if sse_data == "[DONE]" { continue; }
-                        if let Some(val) = extract_json_uint(sse_data, "output_tokens") {
-                            output_tokens = output_tokens.max(val);
+                            if let Some(sse_data) = line.strip_prefix(b"data: ") {
+                                if sse_data != b"[DONE]" {
+                                    if let Ok(text) = std::str::from_utf8(sse_data) {
+                                        if let Some(val) = extract_json_uint_fast(text) {
+                                            output_tokens = output_tokens.max(val);
+                                        }
+                                        if first_text_token.is_none() && text.contains("\"text_delta\"") {
+                                            first_text_token = Some(Instant::now());
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        if first_text_token.is_none() && sse_data.contains("\"text_delta\"") {
-                            first_text_token = Some(Instant::now());
-                        }
+                        None => break,
                     }
                 }
 
+                // In-place compaction: shift unprocessed bytes to front, avoiding new Vec allocation
+                if newline_idx > 0 {
+                    let remaining = buffer.len() - newline_idx;
+                    if remaining > 0 {
+                        buffer.copy_within(newline_idx.., 0);
+                    }
+                    buffer.truncate(remaining);
+                }
+
+                // Forward Bytes directly (zero-copy, ref-counted Arc slice)
                 if tx.send(Ok(data)).await.is_err() { break; }
             }
         }
@@ -526,11 +549,32 @@ fn instrument_stream(
     (new_body, done)
 }
 
-/// 从 SSE JSON data 中提取 "output_tokens": 数字
-fn extract_json_uint(json: &str, field: &str) -> Option<u32> {
-    let search = format!("\"{field}\":");
-    let pos = json.find(&search)?;
-    let after = json[pos + search.len()..].trim_start();
-    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
+/// 从 SSE JSON data 中提取 "output_tokens": 数字 (零分配版本)
+/// 直接在字节层面搜索和解析，避免 String 分配
+fn extract_json_uint_fast(json: &str) -> Option<u32> {
+    // 查找 "output_tokens": 或 "tokens":
+    const PAT1: &[u8] = b"\"output_tokens\":";
+    const PAT2: &[u8] = b"\"tokens\":";
+
+    let bytes = json.as_bytes();
+    let pos = if let Some(p) = bytes.windows(PAT1.len()).position(|w| w == PAT1) {
+        p + PAT1.len()
+    } else if let Some(p) = bytes.windows(PAT2.len()).position(|w| w == PAT2) {
+        p + PAT2.len()
+    } else {
+        return None;
+    };
+
+    // 从冒号后开始提取数字
+    let after = &bytes[pos..];
+    let start = after.iter().position(|&b| b.is_ascii_digit())?;
+    let mut val: u32 = 0;
+    for &b in &after[start..] {
+        if b.is_ascii_digit() {
+            val = val * 10 + (b - b'0') as u32;
+        } else {
+            break;
+        }
+    }
+    Some(val)
 }

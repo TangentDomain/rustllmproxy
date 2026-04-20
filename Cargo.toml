@@ -31,6 +31,10 @@ tokio-stream = "0.1"
 http-body-util = "0.1"
 http-body = "1"
 bytes = "1"
+async-stream = "0.3"
+futures = "0.3"
+memchr = "2"
+parking_lot = "0.12"
 
 [dev-dependencies]
 alloc_counter = "0.0"

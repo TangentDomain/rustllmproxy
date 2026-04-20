@@ -14,11 +14,19 @@ start-unified-proxy.bat
 # Development (port 8091) - isolated environment
 start-unified-proxy-dev.bat
 
-# Stop all
-taskkill /F /IM unified-proxy.exe
+# Stop dev only
+taskkill /F /IM unified-proxy-dev.exe
 ```
 
 **Important**: The startup scripts copy binaries to `run/` or `run-dev/` directories, allowing continued development without locking the running process.
+
+## CRITICAL: Never Kill Production
+
+- **NEVER** use `taskkill /F /IM unified-proxy.exe` — this kills ALL instances including production (port 8090)
+- Production proxy serves real API traffic; killing it disrupts service
+- To rebuild during development: only restart the **dev** instance (port 8091) or mock server
+- Use `start-unified-proxy-dev.bat` for dev testing, never touch production processes
+- If a specific process must be stopped, target by PID, not by image name
 
 ## Environment Setup
 
