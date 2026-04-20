@@ -13,12 +13,20 @@ use axum::body::Body;
 
 #[tokio::main]
 async fn main() {
-    // Load .env file
     dotenv::dotenv().ok();
 
+    let file_appender = tracing_appender::rolling::daily("logs", "unified-proxy.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+    // guard 必须在整个进程生命周期内存活，forget 防止 drop 导致卡死
+    std::mem::forget(guard);
+
     tracing_subscriber::fmt()
+        .with_writer(non_blocking)
         .with_ansi(false)
+        .with_target(false)
         .init();
+
+    info!("Starting unified-proxy, logging to logs/");
 
     let config_path = std::env::args()
         .nth(1)
