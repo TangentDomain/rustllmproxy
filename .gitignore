@@ -1,5 +1,7 @@
 target/
 run/
+logs/
+logs-dev/
 
 # Environment and secrets
 .env

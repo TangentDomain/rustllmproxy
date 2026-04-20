@@ -15,9 +15,16 @@ use axum::body::Body;
 async fn main() {
     dotenv::dotenv().ok();
 
-    let file_appender = tracing_appender::rolling::daily("logs", "unified-proxy.log");
+    let config_path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "configs/unified.toml".to_string());
+    let config = Config::load(&config_path).expect("Failed to load config");
+
+    let log_dir = config.server.log_dir.clone();
+    std::fs::create_dir_all(&log_dir).ok();
+    let log_name = format!("proxy-{}.log", config.server.port);
+    let file_appender = tracing_appender::rolling::daily(&log_dir, log_name);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-    // guard 必须在整个进程生命周期内存活，forget 防止 drop 导致卡死
     std::mem::forget(guard);
 
     tracing_subscriber::fmt()
@@ -26,13 +33,8 @@ async fn main() {
         .with_target(false)
         .init();
 
-    info!("Starting unified-proxy, logging to logs/");
-
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "configs/unified.toml".to_string());
-    let config = Config::load(&config_path).expect("Failed to load config");
-    info!("Loaded config: type=unified, port={}", config.server.port);
+    info!("Starting unified-proxy on :{}, logging to {}/", config.server.port, log_dir);
+    info!("Loaded config: {}", config_path);
 
     let routes = Router::new()
         .route("/openai/v1/models", get(openai_models_handler))

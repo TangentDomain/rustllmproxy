@@ -18,7 +18,11 @@ pub struct Config {
 pub struct ServerConfig {
     pub port: u16,
     pub timeout_secs: u64,
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
 }
+
+fn default_log_dir() -> String { "logs".to_string() }
 
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
