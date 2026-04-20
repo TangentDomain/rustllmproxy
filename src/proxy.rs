@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
@@ -69,10 +69,10 @@ impl Proxy {
     /// - 连接超时(5s)快速失败 → 切换下一个后端
     /// - 不健康的后端直接跳过
     pub async fn handle(&self, req: Request<Body>) -> Response<Body> {
+        let t_start = Instant::now();
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
 
-        // 从扩展中获取协议类型（由 unified.rs 设置）
         let protocol = parts.extensions.get::<String>().cloned();
 
         let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
@@ -83,14 +83,13 @@ impl Proxy {
             }
         };
 
-        // 延迟解析：只在需要修改 model 时才反序列化
         let model = extract_model_from_json(&bytes);
-        info!("Request model={model}, path={path}, protocol={:?}", protocol);
+        let body_size = bytes.len();
+        info!("Request model={model}, path={path}, protocol={:?}, body={body_size}B", protocol);
 
         let chain = self.config.get_fallback_chain(&model);
-
-        // 按fallback链顺序尝试每个模型
         let original_model = &model;
+
         for try_model in &chain {
             let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
             if all_backends.is_empty() {
@@ -98,7 +97,6 @@ impl Proxy {
                 continue;
             }
 
-            // 过滤出健康后端（不健康的直接跳过）
             let healthy: Vec<_> = all_backends.iter()
                 .filter(|b| self.is_healthy(b))
                 .collect();
@@ -110,11 +108,8 @@ impl Proxy {
 
             info!("Trying model={}, healthy backends={}/{}", try_model, healthy.len(), all_backends.len());
 
-            // 每个健康后端只试1次，轮询而非重试同一个
             for selected in &healthy {
                 let resolved = selected.resolve_model(try_model);
-                // model 未变时用 Bytes::clone（Arc 引用计数+1，零数据拷贝）
-                // model 变更时用字节级 patch 替代完整反序列化
                 let body_bytes: Vec<u8> = if resolved == *try_model && *original_model == *try_model {
                     bytes.to_vec()
                 } else {
@@ -122,12 +117,30 @@ impl Proxy {
                 };
 
                 match self.do_forward(&path, &parts.headers, body_bytes, selected).await {
-                    Ok(resp) => {
-                        info!("Success: {} -> {} via {}", try_model, resolved, selected.name);
-                        return resp;
+                    Ok((resp, ttfb, is_stream)) => {
+                        let ttfb_ms = ttfb.as_millis() as u64;
+                        info!("Responding: {} -> {} via {} | ttfb={}ms, body={}B, stream={}",
+                            try_model, resolved, selected.name, ttfb_ms, body_size, is_stream);
+
+                        if is_stream {
+                            // 包裹 stream，完成后打印完整指标
+                            let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start);
+                            let mut resp = Response::new(new_body);
+                            resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
+                            resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
+                            // 后台等待 stream 结束打印日志
+                            let _ = done_rx;
+                            return resp;
+                        } else {
+                            // 非流式：直接返回，已经可以算总时间了
+                            let total_ms = t_start.elapsed().as_millis() as u64;
+                            info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms", model, resolved, selected.name, total_ms, ttfb_ms);
+                            return resp;
+                        }
                     }
                     Err(ForwardError::ClientError(status, body)) => {
-                        warn!("Client error from {}: {} - returning directly", selected.name, status);
+                        let total_ms = t_start.elapsed().as_millis() as u64;
+                        warn!("Client error from {}: {} - returning directly ({}ms)", selected.name, status, total_ms);
                         return (status, body).into_response();
                     }
                     Err(ForwardError::RateLimited) => {
@@ -143,7 +156,8 @@ impl Proxy {
             warn!("All backends exhausted for model={try_model}, falling back");
         }
 
-        error!("All models exhausted for original model={model}");
+        let total_ms = t_start.elapsed().as_millis() as u64;
+        error!("All models exhausted for original model={model} ({}ms)", total_ms);
         (StatusCode::SERVICE_UNAVAILABLE, "All backends exhausted").into_response()
     }
 
@@ -154,7 +168,7 @@ impl Proxy {
         orig_headers: &HeaderMap,
         body: Vec<u8>,
         backend: &Backend,
-    ) -> Result<Response<Body>, ForwardError> {
+    ) -> Result<(Response<Body>, Duration, bool), ForwardError> {
         // Rewrite /v1/ -> /v4/ 仅对 OpenAI 协议 + bigmodel 域名（coding API）
         // Anthropic 格式保持原始路径
         let forward_path = if backend.protocol == "openai" && backend.url.contains("bigmodel") {
@@ -165,8 +179,8 @@ impl Proxy {
         let url = format!("{}{}", backend.url.trim_end_matches('/'), forward_path);
         info!("Forwarding to {} (backend={}, protocol={})", url, backend.name, backend.protocol);
 
-        // 使用总超时（后端配置的timeout_secs）
         let total_timeout = Duration::from_secs(backend.timeout_secs);
+        let t_backend = Instant::now();
 
         let mut req_builder = self.client
             .post(&url)
@@ -207,15 +221,27 @@ impl Proxy {
         let code = status.as_u16();
 
         if status.is_success() {
-            Ok(self.stream_response(resp).await)
+            let ttfb = t_backend.elapsed();
+            let is_stream = resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .map_or(false, |v| v.contains("text/event-stream"));
+            Ok((self.stream_response(resp).await, ttfb, is_stream))
         } else if code == 429 {
-            // Rate Limit → 立即换key，不重试当前
             Err(ForwardError::RateLimited)
-        } else if code >= 400 && code < 500 {
-            // 4xx 客户端错误 → 直接返回给调用方
+        } else if code == 401 {
+            // key 无效，重试也没用，直接返回
             let body_bytes = resp.bytes().await.unwrap_or_default();
-            let status_axum = StatusCode::from_u16(code).unwrap_or(StatusCode::BAD_REQUEST);
-            Err(ForwardError::ClientError(status_axum, String::from_utf8_lossy(&body_bytes).into_owned()))
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            warn!("{} auth failed (401): {}", backend.name, body_str);
+            let status_axum = StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED);
+            Err(ForwardError::ClientError(status_axum, body_str.into_owned()))
+        } else if code >= 400 && code < 500 {
+            // 400/403/404 等 → 后端能力不匹配，尝试下一个
+            let body_bytes = resp.bytes().await.unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            warn!("{} returned {} (4xx), falling back: {}", backend.name, status, body_str);
+            Err(ForwardError::ServerErr(format!("{} returned {}: {}", backend.name, status, body_str)))
         } else {
             // 5xx 服务端错误 → 切换下一个后端
             Err(ForwardError::ServerErr(format!("{} returned {}", backend.name, status)))
@@ -427,4 +453,84 @@ async fn backends_handler(State(proxy): State<Arc<Proxy>>) -> axum::Json<serde_j
 async fn shutdown_signal() {
     signal::ctrl_c().await.expect("failed to listen for ctrl+c");
     info!("Shutting down...");
+}
+
+/// 包裹 stream body，追踪 token 数量，完成后打印完整性能指标
+fn instrument_stream(
+    body: Body,
+    model: String,
+    resolved: String,
+    backend_name: String,
+    ttfb: Duration,
+    t_start: Instant,
+) -> (Body, tokio::task::JoinHandle<()>) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+
+    let done = tokio::spawn(async move {
+        use http_body_util::BodyExt;
+
+        let mut body = std::pin::pin!(body);
+        let mut output_tokens: u32 = 0;
+        let mut first_text_token: Option<Instant> = None;
+        let mut buffer = String::new();
+
+        while let Some(frame_result) = body.frame().await {
+            let frame = match frame_result {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e))).await;
+                    break;
+                }
+            };
+
+            if let Some(data) = frame.into_data().ok() {
+                let text = String::from_utf8_lossy(&data);
+                buffer.push_str(&text);
+
+                while let Some(pos) = buffer.find('\n') {
+                    let line = buffer[..pos].to_string();
+                    buffer = buffer[pos + 1..].to_string();
+
+                    if let Some(sse_data) = line.strip_prefix("data: ") {
+                        if sse_data == "[DONE]" { continue; }
+                        if let Some(val) = extract_json_uint(sse_data, "output_tokens") {
+                            output_tokens = output_tokens.max(val);
+                        }
+                        if first_text_token.is_none() && sse_data.contains("\"text_delta\"") {
+                            first_text_token = Some(Instant::now());
+                        }
+                    }
+                }
+
+                if tx.send(Ok(data)).await.is_err() { break; }
+            }
+        }
+
+        let total_ms = t_start.elapsed().as_millis() as u64;
+        let ttfb_ms = ttfb.as_millis() as u64;
+        let ttft_ms = first_text_token
+            .map(|t| t.duration_since(t_start).as_millis() as u64)
+            .unwrap_or(ttfb_ms);
+        let streaming_ms = total_ms.saturating_sub(ttft_ms);
+        let tokens_per_sec = if output_tokens > 0 && streaming_ms > 0 {
+            output_tokens as f64 / (streaming_ms as f64 / 1000.0)
+        } else { 0.0 };
+
+        info!(
+            "Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s",
+            model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms
+        );
+    });
+
+    let new_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
+    (new_body, done)
+}
+
+/// 从 SSE JSON data 中提取 "output_tokens": 数字
+fn extract_json_uint(json: &str, field: &str) -> Option<u32> {
+    let search = format!("\"{field}\":");
+    let pos = json.find(&search)?;
+    let after = json[pos + search.len()..].trim_start();
+    let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
 }

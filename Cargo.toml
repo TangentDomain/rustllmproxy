@@ -26,6 +26,10 @@ anyhow = "1"
 dashmap = "6"
 dotenv = "0.15"
 rand = "0.8"
+tokio-stream = "0.1"
+http-body-util = "0.1"
+http-body = "1"
+bytes = "1"
 
 [dev-dependencies]
 alloc_counter = "0.0"
