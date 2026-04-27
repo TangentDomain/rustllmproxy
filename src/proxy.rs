@@ -476,7 +476,8 @@ fn instrument_stream(
         use http_body_util::BodyExt;
 
         let mut body = std::pin::pin!(body);
-        let mut output_tokens: u32 = 0;
+        let mut content_text = String::with_capacity(8192);
+        let mut backend_tokens: Option<u32> = None;
         let mut first_text_token: Option<Instant> = None;
         // Pre-allocate with generous capacity to avoid re-allocations during streaming
         let mut buffer = Vec::with_capacity(8192);
@@ -511,10 +512,15 @@ fn instrument_stream(
 
                             if let Some(sse_data) = line.strip_prefix(b"data: ") {
                                 if sse_data != b"[DONE]" {
-                                    output_tokens += 1;
                                     if let Ok(text) = std::str::from_utf8(sse_data) {
+                                        // Detect ttft
                                         if first_text_token.is_none() && (text.contains("\"text_delta\"") || text.contains("\"content\":\"") || text.contains("\"reasoning_content\":\"")) {
                                             first_text_token = Some(Instant::now());
+                                        }
+                                        // Accumulate content text for token counting
+                                        if let Some(s) = extract_content_text(text) { content_text.push_str(&s); }
+                                        if let Some(n) = extract_completion_tokens(text) {
+                                            backend_tokens = Some(n);
                                         }
                                     }
                                 }
@@ -544,8 +550,12 @@ fn instrument_stream(
             .map(|t| t.duration_since(t_start).as_millis() as u64)
             .unwrap_or(ttfb_ms);
         let streaming_ms = total_ms.saturating_sub(ttft_ms);
-        let tokens_per_sec = if output_tokens > 0 && streaming_ms > 0 {
-            output_tokens as f64 / (streaming_ms as f64 / 1000.0)
+        // Prefer backend-reported tokens; fall back to tiktoken BPE count
+        let output_tokens = backend_tokens.unwrap_or_else(|| count_tokens(&content_text));
+        // For batched responses (streaming_ms < 1s), use total_ms as denominator for effective throughput
+        let denom_ms = if streaming_ms < 1000 { total_ms } else { streaming_ms };
+        let tokens_per_sec = if output_tokens > 0 && denom_ms > 0 {
+            output_tokens as f64 / (denom_ms as f64 / 1000.0)
         } else { 0.0 };
 
         let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
@@ -558,5 +568,61 @@ fn instrument_stream(
 
     let new_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     (new_body, done)
+}
+
+/// Extract text from all content fields (content, reasoning_content, thinking) in an SSE JSON chunk.
+/// Handles JSON unescaping for accurate token counting.
+fn extract_content_text(json: &str) -> Option<String> {
+    const FIELDS: &[&[u8]] = &[
+        b"\"content\":\"",
+        b"\"reasoning_content\":\"",
+        b"\"thinking\":\"",
+    ];
+    let bytes = json.as_bytes();
+    let mut result = String::new();
+    for pat in FIELDS {
+        if let Some(pos) = bytes.windows(pat.len()).position(|w| w == *pat) {
+            let mut i = pos + pat.len();
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'\\' if i + 1 < bytes.len() => {
+                        match bytes[i + 1] {
+                            b'"' | b'\\' | b'/' => result.push(bytes[i+1] as char),
+                            b'n' => result.push('\n'),
+                            b't' => result.push('\t'),
+                            b'r' => result.push('\r'),
+                            _ => { result.push(bytes[i] as char); result.push(bytes[i+1] as char); }
+                        }
+                        i += 2;
+                    }
+                    b'"' => break,
+                    b => { result.push(b as char); i += 1; }
+                }
+            }
+        }
+    }
+    if result.is_empty() { None } else { Some(result) }
+}
+
+/// Extract completion_tokens from backend's final usage chunk.
+fn extract_completion_tokens(json: &str) -> Option<u32> {
+    let bytes = json.as_bytes();
+    let pat = b"\"completion_tokens\":";
+    let pos = bytes.windows(pat.len()).position(|w| w == pat)?;
+    let after = &bytes[pos + pat.len()..];
+    let start = after.iter().position(|&b| b.is_ascii_digit())?;
+    let mut val: u32 = 0;
+    for &b in &after[start..] {
+        if b.is_ascii_digit() { val = val * 10 + (b - b'0') as u32; } else { break; }
+    }
+    Some(val)
+}
+
+/// Count tokens using tiktoken cl100k_base BPE encoding.
+/// Accurate for mixed Chinese/English text across most modern LLMs.
+fn count_tokens(text: &str) -> u32 {
+    use tiktoken_rs::cl100k_base;
+    let bpe = cl100k_base().expect("tiktoken init failed");
+    bpe.encode_ordinary(text).len() as u32
 }
 
