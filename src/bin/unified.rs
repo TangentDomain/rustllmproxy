@@ -30,6 +30,7 @@ async fn main() {
     use tracing_subscriber::prelude::*;
 
     tracing_subscriber::registry()
+        .with(tracing_subscriber::filter::LevelFilter::INFO)
         .with(tracing_subscriber::fmt::Layer::new().with_writer(std::io::stdout).with_ansi(true).with_target(false))
         .with(tracing_subscriber::fmt::Layer::new().with_writer(non_blocking).with_ansi(false).with_target(false))
         .init();

@@ -125,7 +125,8 @@ impl Proxy {
                             try_model, resolved, selected.name, ttfb_ms, body_size, is_stream);
 
                         if is_stream {
-                            let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start);
+                        let idle_timeout = Duration::from_secs(self.config.server.stream_idle_timeout_secs);
+                        let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout);
                             let mut resp = Response::new(new_body);
                             resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
                             resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
@@ -180,12 +181,10 @@ impl Proxy {
         let url = format!("{}{}", backend.url.trim_end_matches('/'), forward_path);
         info!("Forwarding to {} (backend={}, protocol={})", url, backend.name, backend.protocol);
 
-        let total_timeout = Duration::from_secs(backend.timeout_secs);
         let t_backend = Instant::now();
 
         let mut req_builder = self.client
             .post(&url)
-            .timeout(total_timeout)
             .body(body);
 
         // 使用预计算的 auth_header（启动时生成，避免每次 format! 分配）
@@ -465,6 +464,7 @@ fn instrument_stream(
     backend_name: String,
     ttfb: Duration,
     t_start: Instant,
+    stream_idle_timeout: Duration,
 ) -> (Body, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -476,8 +476,15 @@ fn instrument_stream(
         let mut first_text_token: Option<Instant> = None;
         // Pre-allocate with generous capacity to avoid re-allocations during streaming
         let mut buffer = Vec::with_capacity(8192);
-
-        while let Some(frame_result) = body.frame().await {
+        loop {
+            let frame_result = match tokio::time::timeout(stream_idle_timeout, body.frame()).await {
+                Ok(Some(result)) => result,
+                Ok(None) => break, // stream 正常结束
+                Err(_) => {
+                    warn!("Stream idle timeout ({}s) on {} via {}, aborting", stream_idle_timeout.as_secs(), model, backend_name);
+                    break;
+                }
+            };
             let frame = match frame_result {
                 Ok(f) => f,
                 Err(e) => {

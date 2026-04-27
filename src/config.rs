@@ -20,9 +20,14 @@ pub struct ServerConfig {
     pub timeout_secs: u64,
     #[serde(default = "default_log_dir")]
     pub log_dir: String,
+    #[serde(default = "default_stream_idle_timeout")]
+    /// 流式响应中两个 chunk 之间的最大空闲时间，超时则断开连接
+    pub stream_idle_timeout_secs: u64,
 }
 
+
 fn default_log_dir() -> String { "logs".to_string() }
+fn default_stream_idle_timeout() -> u64 { 30 }
 
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
