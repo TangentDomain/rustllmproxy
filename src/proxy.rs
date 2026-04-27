@@ -549,18 +549,21 @@ fn instrument_stream(
     (new_body, done)
 }
 
-/// 从 SSE JSON data 中提取 "output_tokens": 数字 (零分配版本)
+/// 从 SSE JSON data 中提取输出 token 数 (零分配版本)
 /// 直接在字节层面搜索和解析，避免 String 分配
+/// 覆盖协议：Anthropic(output_tokens) / OpenAI(completion_tokens) / Anthropic usage(tokens)
 fn extract_json_uint_fast(json: &str) -> Option<u32> {
-    // 查找 "output_tokens": 或 "tokens":
     const PAT1: &[u8] = b"\"output_tokens\":";
     const PAT2: &[u8] = b"\"tokens\":";
+    const PAT3: &[u8] = b"\"completion_tokens\":";
 
     let bytes = json.as_bytes();
     let pos = if let Some(p) = bytes.windows(PAT1.len()).position(|w| w == PAT1) {
         p + PAT1.len()
     } else if let Some(p) = bytes.windows(PAT2.len()).position(|w| w == PAT2) {
         p + PAT2.len()
+    } else if let Some(p) = bytes.windows(PAT3.len()).position(|w| w == PAT3) {
+        p + PAT3.len()
     } else {
         return None;
     };
