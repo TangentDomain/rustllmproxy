@@ -17,7 +17,41 @@ use tracing::{info, warn, error};
 
 use crate::balancer::WeightedRoundRobin;
 use crate::config::{Config, Backend};
+use std::collections::HashMap;
+use parking_lot::RwLock;
+
+/// Per-backend tok/s rolling window for adaptive load balancing.
+/// Faster backends get more traffic automatically.
+pub struct BackendMetrics {
+    tok_per_sec: RwLock<HashMap<String, Vec<f64>>>,
+    window: usize,
+}
+
+impl BackendMetrics {
+    pub fn new(window: usize) -> Self {
+        Self { tok_per_sec: RwLock::new(HashMap::new()), window }
+    }
+
+    /// Record a tok/s sample for a backend.
+    pub fn record(&self, backend: &str, tps: f64) {
+        if tps <= 0.0 { return; }
+        let mut map = self.tok_per_sec.write();
+        let v = map.entry(backend.to_string()).or_default();
+        v.push(tps);
+        if v.len() > self.window { v.remove(0); }
+    }
+
+    /// Rolling average tok/s for a backend. Returns 1.0 if no data (equal default weight).
+    pub fn avg(&self, backend: &str) -> f64 {
+        let map = self.tok_per_sec.read();
+        map.get(backend)
+            .filter(|v| !v.is_empty())
+            .map(|v| v.iter().sum::<f64>() / v.len() as f64)
+            .unwrap_or(1.0)
+    }
+}
 use crate::middleware::RateLimiter;
+use crate::metrics::MetricsStore;
 
 /// 转发错误分类，决定后续行为
 enum ForwardError {
@@ -34,7 +68,9 @@ pub struct Proxy {
     config: Arc<Config>,
     balancer: Arc<WeightedRoundRobin>,
     limiter: Arc<RateLimiter>,
+    metrics: Arc<BackendMetrics>,
     client: Client,
+    store: Arc<MetricsStore>,
 }
 
 impl Proxy {
@@ -45,7 +81,12 @@ impl Proxy {
             .connect_timeout(Duration::from_secs(3))
             .build()
             .expect("failed to build reqwest client");
-        Self { config, balancer, limiter: Arc::new(RateLimiter::new()), client }
+        let log_dir = config.server.log_dir.clone();
+        Self {
+            config, balancer, limiter: Arc::new(RateLimiter::new()), client,
+            metrics: Arc::new(BackendMetrics::new(10)),
+            store: Arc::new(MetricsStore::new(&format!("{log_dir}/metrics"))),
+        }
     }
 
     pub fn balancer(&self) -> &Arc<WeightedRoundRobin> {
@@ -122,7 +163,12 @@ impl Proxy {
 
             info!("Trying model={}, healthy backends={}/{}", try_model, healthy.len(), all_backends.len());
 
-            let start = self.balancer().next_random() as usize % healthy.len();
+            // Adaptive: weighted random by recent tok/s, faster backends get more traffic
+            let weights: Vec<f64> = healthy.iter().map(|b| self.metrics.avg(&b.name)).collect();
+            let total_w: f64 = weights.iter().sum();
+            let r = (self.balancer().next_random() as f64) / (u64::MAX as f64) * total_w;
+            let mut cum = 0.0;
+            let start = weights.iter().position(|w| { cum += w; cum >= r }).unwrap_or(0);
             for i in 0..healthy.len() {
                 let selected = &healthy[(start + i) % healthy.len()];
                 let resolved = selected.resolve_model(try_model);
@@ -141,7 +187,7 @@ impl Proxy {
 
                         if is_stream {
                         let idle_timeout = Duration::from_secs(self.config.server.stream_idle_timeout_secs);
-                        let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout);
+                        let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout, self.metrics.clone(), self.store.clone());
                             let mut resp = Response::new(new_body);
                             resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
                             resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
@@ -439,6 +485,7 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
         }))
         .layer(axum::middleware::from_fn_with_state(proxy.clone(), auth_layer));
 
+    let store = proxy.store.clone();
     let app = public_routes
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
@@ -446,6 +493,16 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
         .with_state(proxy);
 
     info!("Listening on {addr}");
+
+    // Periodic metrics flush (every 30s)
+    // Periodic metrics flush (every 30s)
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            store.flush();
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -480,7 +537,9 @@ fn instrument_stream(
     ttfb: Duration,
     t_start: Instant,
     stream_idle_timeout: Duration,
-) -> (Body, tokio::task::JoinHandle<()>) {
+    metrics: Arc<BackendMetrics>,
+    store: Arc<MetricsStore>,
+    ) -> (Body, tokio::task::JoinHandle<()>) {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let done = tokio::spawn(async move {
@@ -568,6 +627,9 @@ fn instrument_stream(
         let tokens_per_sec = if output_tokens > 0 && denom_ms > 0 {
             output_tokens as f64 / (denom_ms as f64 / 1000.0)
         } else { 0.0 };
+
+        metrics.record(&backend_name, tokens_per_sec);
+        store.record(&backend_name, &model, tokens_per_sec, ttfb_ms, ttft_ms, total_ms, output_tokens);
 
         let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
         if slow {

@@ -29,7 +29,7 @@ pub struct ServerConfig {
 
 
 fn default_log_dir() -> String { "logs".to_string() }
-fn default_stream_idle_timeout() -> u64 { 30 }
+fn default_stream_idle_timeout() -> u64 { 120 }
 
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {

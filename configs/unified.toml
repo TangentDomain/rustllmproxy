@@ -40,7 +40,7 @@ default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "g
 # ─── 模型映射 ────────────────────────────────────────────
 
 [model_mapping]
-"glm-4.7" = ["MiniMax-M2.7"]
+"glm-4.7" = ["glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air", "MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
 
 # ─── OpenAI 后端 ───────────────────────────────────────────
 
@@ -61,7 +61,7 @@ name = "minimax-coding-1"
 url = "https://api.minimaxi.com"
 api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+models = ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
@@ -95,7 +95,7 @@ name = "minimax-anthropic-1"
 url = "https://api.minimaxi.com/anthropic"
 api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+models = ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"
