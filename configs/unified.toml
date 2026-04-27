@@ -17,25 +17,25 @@ rate_limit = 999
 # ─── Fallback 链 ──────────────────────────────────────────
 
 [fallback]
-# 旗舰模型：优先同级别降级，再跨级
-"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6"]
-"glm-5v-turbo" = ["glm-5-turbo", "glm-5.1", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5"]
-"glm-5-turbo"  = ["glm-5v-turbo", "glm-5.1", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5"]
+# 旗舰模型：只在旗舰/高端之间降级，不跌到中端
+"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7"]
+"glm-5v-turbo" = ["glm-5-turbo", "glm-5.1", "MiniMax-M2.7"]
+"glm-5-turbo"  = ["glm-5v-turbo", "glm-5.1", "MiniMax-M2.7"]
 
-# 中端模型
-"glm-4.7"      = ["MiniMax-M2.7", "glm-4.6", "glm-4.5", "MiniMax-M2.5", "glm-4.5-air"]
+# 中端模型：只在同级别降级，不跌到轻量
+"glm-4.7"      = ["MiniMax-M2.7", "glm-5-turbo", "MiniMax-M2.5"]
 
-# 轻量模型
-"glm-4.6"      = ["glm-4.7", "MiniMax-M2.7", "MiniMax-M2.5", "glm-4.5"]
-"glm-4.5"      = ["glm-4.6", "glm-4.7", "MiniMax-M2.7", "MiniMax-M2.5"]
+# 轻量模型：互相兜底
+"glm-4.6"      = ["glm-4.7", "glm-4.5", "MiniMax-M2.5"]
+"glm-4.5"      = ["glm-4.6", "glm-4.7", "MiniMax-M2.5"]
 "glm-4.5-air"  = ["glm-4.5", "glm-4.6", "glm-4.7"]
 
 # MiniMax模型
-"MiniMax-M2.7"  = ["MiniMax-M2.5", "glm-4.7", "glm-4.6", "glm-5v-turbo"]
+"MiniMax-M2.7"  = ["MiniMax-M2.5", "glm-5-turbo", "glm-4.7"]
 "MiniMax-M2.5"  = ["MiniMax-M2.7", "glm-4.7", "glm-4.6"]
 
 # 兜底
-default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "MiniMax-M2.7", "MiniMax-M2.5", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6", "glm-4.5", "glm-4.5-air"]
 
 # ─── OpenAI 后端 ───────────────────────────────────────────
 
