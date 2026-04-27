@@ -9,8 +9,7 @@ path = "src/bin/unified.rs"
 
 [[bin]]
 name = "mock_llm_server"
-path = "tests/mock_llm_server.rs"
-
+path = "src/bin/mock_llm_server.rs"
 [[bin]]
 name = "log_analyzer"
 path = "src/bin/log_analyzer.rs"

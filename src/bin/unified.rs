@@ -27,10 +27,11 @@ async fn main() {
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     std::mem::forget(guard);
 
-    tracing_subscriber::fmt()
-        .with_writer(non_blocking)
-        .with_ansi(false)
-        .with_target(false)
+    use tracing_subscriber::prelude::*;
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::Layer::new().with_writer(std::io::stdout).with_ansi(true).with_target(false))
+        .with(tracing_subscriber::fmt::Layer::new().with_writer(non_blocking).with_ansi(false).with_target(false))
         .init();
 
     info!("Starting unified-proxy on :{}, logging to {}/", config.server.port, log_dir);

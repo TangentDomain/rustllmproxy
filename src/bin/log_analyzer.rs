@@ -103,13 +103,6 @@ fn percentile_u64(vec: &mut [u64], p: f64) -> u64 {
     vec[idx.min(vec.len() - 1)]
 }
 
-fn percentile_f64(vec: &mut [f64], p: f64) -> f64 {
-    if vec.is_empty() { return 0.0; }
-    let mut v = vec.to_vec();
-    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let idx = (v.len() as f64 * p / 100.0).floor() as usize;
-    v[idx.min(v.len() - 1)]
-}
 
 fn main() -> Result<()> {
     let log_path = std::env::args().nth(1).unwrap_or_else(|| {
