@@ -2,6 +2,14 @@
 
 基于 Rust 的高性能 LLM 代理服务，支持多后端负载均衡和智能故障转移。
 
+## ⚠️ CRITICAL: 生产环境保护
+
+**切勿使用 `taskkill /F /IM unified-proxy.exe`** — 这会杀死所有实例（包括生产环境 8090 端口）。
+
+- 生产端口 `8090`：承载真实流量
+- 开发端口 `8091`：用于测试，独立环境
+- 重启开发环境：`start-unified-proxy-dev.bat` 或 `taskkill /F /IM unified-proxy-dev.exe`
+
 ## 功能特性
 
 - **统一代理**：单个进程同时支持 OpenAI 和 Anthropic API
@@ -13,15 +21,28 @@
 
 ## 快速开始
 
-```bash
-# 构建
-cargo build --release
+### 环境要求
 
-# 启动（自动拷贝到 run/ 目录，不影响后续编译）
+- Rust 1.70+
+- 复制 `.env.example` 为 `.env` 并配置 API keys
+
+### 构建
+
+```bash
+cargo build --release
+```
+
+### 启动
+
+```bash
+# 生产环境（端口 8090）
 start-unified-proxy.bat
 
-# 停止
-taskkill /F /IM unified-proxy.exe
+# 开发环境（端口 8091，日志在 logs-dev/）
+start-unified-proxy-dev.bat
+
+# 停止开发环境
+taskkill /F /IM unified-proxy-dev.exe
 ```
 
 ## API 路由
@@ -32,6 +53,15 @@ taskkill /F /IM unified-proxy.exe
 |------|---------|------|
 | OpenAI | `/openai/v1/...` | `/openai/v1/chat/completions` |
 | Anthropic | `/anthropic/v1/...` | `/anthropic/v1/messages` |
+
+### 管理端点
+
+| 端点 | 认证 | 说明 |
+|------|------|------|
+| `GET /health` | 无 | 健康检查 |
+| `GET /backends` | 需要认证 | 后端状态（名称、URL、健康状态、失败次数） |
+| `GET /openai/v1/models` | 需要认证 | 可用模型列表（OpenAI 格式）|
+| `GET /anthropic/v1/models` | 需要认证 | 可用模型列表（Anthropic 格式）|
 
 ## 配置说明
 
