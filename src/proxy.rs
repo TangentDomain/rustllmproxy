@@ -164,7 +164,10 @@ impl Proxy {
             info!("Trying model={}, healthy backends={}/{}", try_model, healthy.len(), all_backends.len());
 
             // Adaptive: weighted random by recent tok/s, faster backends get more traffic
+            // Backends with no data get the average of those with data (proportional, no starvation)
             let weights: Vec<f64> = healthy.iter().map(|b| self.metrics.avg(&b.name)).collect();
+            let avg_w = weights.iter().filter(|&&w| w > 1.0).sum::<f64>() / weights.iter().filter(|&&w| w > 1.0).count().max(1) as f64;
+            let weights: Vec<f64> = weights.iter().map(|&w| if w <= 1.0 { avg_w } else { w }).collect();
             let total_w: f64 = weights.iter().sum();
             let r = (self.balancer().next_random() as f64) / (u64::MAX as f64) * total_w;
             let mut cum = 0.0;
