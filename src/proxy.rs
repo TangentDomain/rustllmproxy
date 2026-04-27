@@ -87,7 +87,16 @@ impl Proxy {
         let model = extract_model_from_json(&bytes);
         let body_size = bytes.len();
         let original_model = model.clone();
-        let model = self.config.model_mapping.get(&model).cloned().unwrap_or(model);
+        let model = if let Some(group) = self.config.model_mapping.get(&model) {
+            if group.len() == 1 {
+                group[0].clone()
+            } else {
+                let idx = self.balancer().next_random() as usize % group.len();
+                group[idx].clone()
+            }
+        } else {
+            model
+        };
         if model != original_model {
             info!("Model mapping: {original_model} -> {model}");
         }

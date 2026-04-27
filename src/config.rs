@@ -13,7 +13,7 @@ pub struct Config {
     pub retry_delay_ms: u64,
     pub fallback: HashMap<String, Vec<String>>,
     #[serde(default)]
-    pub model_mapping: HashMap<String, String>,
+    pub model_mapping: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
