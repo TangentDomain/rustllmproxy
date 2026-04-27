@@ -86,10 +86,14 @@ impl Proxy {
 
         let model = extract_model_from_json(&bytes);
         let body_size = bytes.len();
+        let original_model = model.clone();
+        let model = self.config.model_mapping.get(&model).cloned().unwrap_or(model);
+        if model != original_model {
+            info!("Model mapping: {original_model} -> {model}");
+        }
         info!("Request model={model}, path={path}, protocol={:?}, body={body_size}B", protocol);
 
         let chain = self.config.get_fallback_chain(&model);
-        let original_model = &model;
 
         for try_model in &chain {
             let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
@@ -115,7 +119,7 @@ impl Proxy {
                 let body_bytes: Bytes = if resolved == *try_model && *original_model == *try_model {
                     bytes.clone() // Bytes::clone is O(1) refcount increment
                 } else {
-                    Bytes::from(patch_json_model(&bytes, original_model, &resolved))
+                    Bytes::from(patch_json_model(&bytes, &original_model, &resolved))
                 };
 
                 match self.do_forward(&path, &parts.headers, body_bytes, selected).await {
@@ -507,11 +511,9 @@ fn instrument_stream(
 
                             if let Some(sse_data) = line.strip_prefix(b"data: ") {
                                 if sse_data != b"[DONE]" {
+                                    output_tokens += 1;
                                     if let Ok(text) = std::str::from_utf8(sse_data) {
-                                        if let Some(val) = extract_json_uint_fast(text) {
-                                            output_tokens = output_tokens.max(val);
-                                        }
-                                        if first_text_token.is_none() && text.contains("\"text_delta\"") {
+                                        if first_text_token.is_none() && (text.contains("\"text_delta\"") || text.contains("\"content\":\"") || text.contains("\"reasoning_content\":\"")) {
                                             first_text_token = Some(Instant::now());
                                         }
                                     }
@@ -546,45 +548,15 @@ fn instrument_stream(
             output_tokens as f64 / (streaming_ms as f64 / 1000.0)
         } else { 0.0 };
 
-        info!(
-            "Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s",
-            model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms
-        );
+        let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
+        if slow {
+            warn!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
+        } else {
+            info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
+        }
     });
 
     let new_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     (new_body, done)
 }
 
-/// 从 SSE JSON data 中提取输出 token 数 (零分配版本)
-/// 直接在字节层面搜索和解析，避免 String 分配
-/// 覆盖协议：Anthropic(output_tokens) / OpenAI(completion_tokens) / Anthropic usage(tokens)
-fn extract_json_uint_fast(json: &str) -> Option<u32> {
-    const PAT1: &[u8] = b"\"output_tokens\":";
-    const PAT2: &[u8] = b"\"tokens\":";
-    const PAT3: &[u8] = b"\"completion_tokens\":";
-
-    let bytes = json.as_bytes();
-    let pos = if let Some(p) = bytes.windows(PAT1.len()).position(|w| w == PAT1) {
-        p + PAT1.len()
-    } else if let Some(p) = bytes.windows(PAT2.len()).position(|w| w == PAT2) {
-        p + PAT2.len()
-    } else if let Some(p) = bytes.windows(PAT3.len()).position(|w| w == PAT3) {
-        p + PAT3.len()
-    } else {
-        return None;
-    };
-
-    // 从冒号后开始提取数字
-    let after = &bytes[pos..];
-    let start = after.iter().position(|&b| b.is_ascii_digit())?;
-    let mut val: u32 = 0;
-    for &b in &after[start..] {
-        if b.is_ascii_digit() {
-            val = val * 10 + (b - b'0') as u32;
-        } else {
-            break;
-        }
-    }
-    Some(val)
-}
