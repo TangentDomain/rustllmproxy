@@ -570,38 +570,40 @@ fn instrument_stream(
     (new_body, done)
 }
 
-/// Extract text from all content fields (content, reasoning_content, thinking) in an SSE JSON chunk.
-/// Handles JSON unescaping for accurate token counting.
+/// Extract text from content, reasoning_content, and thinking fields.
+/// Accumulates raw UTF-8 bytes (no serde_json, non-blocking).
 fn extract_content_text(json: &str) -> Option<String> {
-    const FIELDS: &[&[u8]] = &[
-        b"\"content\":\"",
-        b"\"reasoning_content\":\"",
-        b"\"thinking\":\"",
-    ];
     let bytes = json.as_bytes();
-    let mut result = String::new();
-    for pat in FIELDS {
-        if let Some(pos) = bytes.windows(pat.len()).position(|w| w == *pat) {
-            let mut i = pos + pat.len();
-            while i < bytes.len() {
-                match bytes[i] {
-                    b'\\' if i + 1 < bytes.len() => {
-                        match bytes[i + 1] {
-                            b'"' | b'\\' | b'/' => result.push(bytes[i+1] as char),
-                            b'n' => result.push('\n'),
-                            b't' => result.push('\t'),
-                            b'r' => result.push('\r'),
-                            _ => { result.push(bytes[i] as char); result.push(bytes[i+1] as char); }
-                        }
-                        i += 2;
-                    }
-                    b'"' => break,
-                    b => { result.push(b as char); i += 1; }
+    let mut buf = Vec::with_capacity(64);
+    fn extract_value(bytes: &[u8], start: usize, buf: &mut Vec<u8>) {
+        const BS: u8 = 92;
+        let mut j = start;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if b == BS && j + 1 < bytes.len() {
+                match bytes[j + 1] {
+                    b'"' | BS | b'/' => { buf.push(bytes[j + 1]); j += 2; }
+                    b'n' => { buf.push(10); j += 2; }
+                    b't' => { buf.push(9); j += 2; }
+                    b'r' => { buf.push(13); j += 2; }
+                    _ => { buf.push(b); buf.push(bytes[j + 1]); j += 2; }
                 }
-            }
+            } else if b == b'"' { break; }
+            else { buf.push(b); j += 1; }
         }
     }
-    if result.is_empty() { None } else { Some(result) }
+    if let Some(pos) = bytes.windows(b"\"reasoning_content\":\"".len()).position(|w| w == *b"\"reasoning_content\":\"") {
+        extract_value(bytes, pos + b"\"reasoning_content\":\"".len(), &mut buf);
+    }
+    if let Some(pos) = bytes.windows(b"\"content\":\"".len()).position(|w| w == *b"\"content\":\"") {
+        if pos == 0 || bytes[pos - 1] != b'_' {
+            extract_value(bytes, pos + b"\"content\":\"".len(), &mut buf);
+        }
+    }
+    if let Some(pos) = bytes.windows(b"\"thinking\":\"".len()).position(|w| w == *b"\"thinking\":\"") {
+        extract_value(bytes, pos + b"\"thinking\":\"".len(), &mut buf);
+    }
+    if buf.is_empty() { None } else { String::from_utf8(buf).ok() }
 }
 
 /// Extract completion_tokens from backend's final usage chunk.
