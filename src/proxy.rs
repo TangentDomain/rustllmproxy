@@ -113,7 +113,9 @@ impl Proxy {
 
             info!("Trying model={}, healthy backends={}/{}", try_model, healthy.len(), all_backends.len());
 
-            for selected in &healthy {
+            let start = self.balancer().next_random() as usize % healthy.len();
+            for i in 0..healthy.len() {
+                let selected = &healthy[(start + i) % healthy.len()];
                 let resolved = selected.resolve_model(try_model);
                 // Use Bytes directly when model unchanged (zero-copy via refcount), otherwise patch
                 let body_bytes: Bytes = if resolved == *try_model && *original_model == *try_model {
