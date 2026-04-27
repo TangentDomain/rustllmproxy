@@ -37,6 +37,11 @@ rate_limit = 999
 # 兜底
 default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6", "glm-4.5", "glm-4.5-air"]
 
+# ─── 模型映射 ────────────────────────────────────────────
+
+[model_mapping]
+"glm-4.7" = "MiniMax-M2.7"
+
 # ─── OpenAI 后端 ───────────────────────────────────────────
 
 # 智谱后端：支持所有GLM模型
