@@ -64,6 +64,9 @@ pub struct Backend {
     /// 预计算的认证 header（启动时生成，跳过反序列化）
     #[serde(skip)]
     pub auth_header: String,
+    /// 转发前需要从请求体中删除的参数名（如 thinking、metadata）
+    #[serde(default)]
+    pub strip_params: Vec<String>,
 }
 
 fn default_connect_timeout() -> u64 { 5 }
@@ -181,6 +184,7 @@ mod tests {
             model_mappings: HashMap::new(),
             protocol: "openai".to_string(),
             auth_header: format!("Bearer key-{name}"),
+            strip_params: vec![],
         }
     }
 
@@ -200,18 +204,20 @@ mod tests {
             model_mappings: m,
             protocol: "openai".to_string(),
             auth_header: format!("Bearer key-{name}"),
+            strip_params: vec![],
         }
     }
 
     fn make_config(fallback: HashMap<String, Vec<String>>, backends: Vec<Backend>) -> Config {
         Config {
-            server: ServerConfig { port: 8091, timeout_secs: 30, log_dir: "logs".to_string() },
+            server: ServerConfig { port: 8091, timeout_secs: 30, log_dir: "logs".to_string(), stream_idle_timeout_secs: 120 },
             r#type: "openai".to_string(),
             auth: AuthConfig { enabled: false, keys: vec![] },
             backends,
             retry: 2,
             retry_delay_ms: 500,
             fallback,
+            model_mapping: HashMap::new(),
         }
     }
 

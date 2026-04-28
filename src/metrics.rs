@@ -1,7 +1,6 @@
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::fs;
 use std::path::PathBuf;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Single request metric sample
@@ -66,14 +65,14 @@ impl ModelFile {
 pub struct MetricsStore {
     dir: PathBuf,
     // (backend, model) → samples
-    data: Mutex<HashMap<(String, String), Vec<Sample>>>,
+    data: DashMap<(String, String), Vec<Sample>>,
 }
 
 impl MetricsStore {
     pub fn new(base_dir: &str) -> Self {
         let dir = PathBuf::from(base_dir);
         fs::create_dir_all(&dir).ok();
-        Self { dir, data: Mutex::new(HashMap::new()) }
+        Self { dir, data: DashMap::new() }
     }
 
     /// Record a completed request
@@ -96,8 +95,8 @@ impl MetricsStore {
             total_ms,
             tokens,
         };
-        let mut data = self.data.lock();
-        let samples = data.entry((backend.to_string(), model.to_string())).or_default();
+        let key = (backend.to_string(), model.to_string());
+        let mut samples = self.data.entry(key).or_default();
         samples.push(sample);
         // Keep last 1000 in memory
         if samples.len() > 1000 {
@@ -106,10 +105,26 @@ impl MetricsStore {
         }
     }
 
+    /// Average tok/s for a model aggregated across all backends.
+    /// Returns 1.0 when there is no data so callers can use equal default weights.
+    pub fn avg_for_model(&self, model: &str) -> f64 {
+        let mut sum = 0.0;
+        let mut count = 0usize;
+        for entry in self.data.iter() {
+            let ((_, sample_model), samples) = entry.pair();
+            if sample_model != model || samples.is_empty() {
+                continue;
+            }
+            sum += samples.iter().map(|s| s.tok_per_sec).sum::<f64>();
+            count += samples.len();
+        }
+        if count == 0 { 1.0 } else { sum / count as f64 }
+    }
+
     /// Flush all metrics to disk (call periodically)
     pub fn flush(&self) {
-        let data = self.data.lock();
-        for ((backend, model), samples) in data.iter() {
+        for entry in self.data.iter() {
+            let ((backend, model), samples) = entry.pair();
             if samples.is_empty() { continue; }
             let model_file = ModelFile::compute(samples);
             let backend_dir = self.dir.join(sanitize_filename(backend));

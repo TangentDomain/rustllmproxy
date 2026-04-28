@@ -133,17 +133,52 @@ impl Proxy {
         }
         let body_size = bytes.len();
         let original_model = model.clone();
+        let mut mapping_logged = false;
         let model = if let Some(group) = self.config.model_mapping.get(&model) {
             if group.len() == 1 {
                 group[0].clone()
             } else {
-                let idx = rand::thread_rng().gen_range(0..group.len());
-                group[idx].clone()
+                // Weighted random by observed model tok/s (aggregated across backends).
+                // If no data yet for any model, fall back to uniform random.
+                let raw: Vec<f64> = group.iter().map(|m| self.store.avg_for_model(m)).collect();
+                let with_data: Vec<f64> = raw.iter().copied().filter(|&w| w != 1.0).collect();
+                let weights: Vec<f64> = if with_data.is_empty() {
+                    raw.clone()
+                } else {
+                    let avg_w = with_data.iter().sum::<f64>() / with_data.len() as f64;
+                    raw.iter().map(|&w| if w == 1.0 { avg_w } else { w }).collect()
+                };
+                let total_w: f64 = weights.iter().sum();
+                let (idx, reason, r_opt) = if total_w <= 0.0 {
+                    let idx = rand::thread_rng().gen_range(0..group.len());
+                    (idx, "uniform(no_data)", None)
+                } else {
+                    let r = rand::random::<f64>() * total_w;
+                    let mut cum = 0.0;
+                    let idx = weights.iter().position(|w| { cum += *w; cum >= r }).unwrap_or(0);
+                    (idx, "weighted(tok/s)", Some(r))
+                };
+                let chosen = group[idx].clone();
+                mapping_logged = true;
+                info!(
+                    "Model mapping: {} -> {} | reason={}, candidates={:?}, raw_tok_s={:?}, weights={:?}, picked_index={}/{}, random_value={}, total_weight={}",
+                    original_model,
+                    chosen,
+                    reason,
+                    group,
+                    raw,
+                    weights,
+                    idx,
+                    group.len(),
+                    r_opt.map(|v| format!("{v:.2}")).unwrap_or_else(|| "N/A".to_string()),
+                    total_w
+                );
+                chosen
             }
         } else {
             model
         };
-        if model != original_model {
+        if model != original_model && !mapping_logged {
             info!("Model mapping: {original_model} -> {model}");
         }
         let max_tokens = extract_max_tokens(&bytes);
@@ -517,10 +552,12 @@ fn prepare_request_body(
     backend: &Backend,
 ) -> Bytes {
     let needs_model_patch = resolved != try_model || original_model != try_model;
-    let needs_special_transform = backend.protocol == "anthropic"
-        && (backend.name == "zhipu-anthropic" || backend.name.starts_with("minimax-anthropic"));
+    let needs_strip = !backend.strip_params.is_empty();
+    let needs_sanitize = backend.name == "zhipu-anthropic";
+    // MiniMax Anthropic needs max_completion_tokens → max_tokens rename
+    let needs_max_tokens_rename = backend.protocol == "anthropic" && backend.name.starts_with("minimax-anthropic");
 
-    if !needs_model_patch && !needs_special_transform {
+    if !needs_model_patch && !needs_strip && !needs_sanitize && !needs_max_tokens_rename {
         return bytes.clone();
     }
 
@@ -530,16 +567,35 @@ fn prepare_request_body(
         bytes.to_vec()
     };
 
-    // Step 2: Backend-specific preprocessing (only Anthropic backends that need it)
-    if backend.protocol != "anthropic" {
-        return Bytes::from(base); // OpenAI: no transform
+    // Step 2: sanitize for strict JSON parsers (zhipu-anthropic)
+    let base = if needs_sanitize {
+        sanitize_json_bytes(&base)
+    } else {
+        base
+    };
+
+    // Step 3: strip configured params + optional max_completion_tokens rename
+    if !needs_strip && !needs_max_tokens_rename {
+        return Bytes::from(base);
     }
 
-    match backend.name.as_str() {
-        "zhipu-anthropic" => Bytes::from(sanitize_json_bytes(&base)),
-        name if name.starts_with("minimax-anthropic") => Bytes::from(filter_minimax_params(&base)),
-        _ => Bytes::from(base),
+    let mut val: serde_json::Value = match serde_json::from_slice(&base) {
+        Ok(v) => v,
+        Err(_) => return Bytes::from(base),
+    };
+
+    if let Some(obj) = val.as_object_mut() {
+        for field in &backend.strip_params {
+            obj.remove(field);
+        }
+        if needs_max_tokens_rename {
+            if let Some(max_comp) = obj.remove("max_completion_tokens") {
+                obj.entry("max_tokens").or_insert(max_comp);
+            }
+        }
     }
+
+    Bytes::from(serde_json::to_vec(&val).unwrap_or(base))
 }
 
 /// Sanitize JSON bytes: strip trailing commas, BOM, and re-serialize cleanly.
@@ -590,29 +646,6 @@ fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Filter/transform Anthropic params for MiniMax compatibility.
-/// MiniMax's Anthropic-compatible API rejects certain Anthropic-specific fields.
-fn filter_minimax_params(bytes: &[u8]) -> Vec<u8> {
-    // First sanitize (strip trailing commas, etc.)
-    let sanitized = sanitize_json_bytes(bytes);
-    let mut val: serde_json::Value = match serde_json::from_slice(&sanitized) {
-        Ok(v) => v,
-        Err(_) => return sanitized,
-    };
-
-    if let Some(obj) = val.as_object_mut() {
-        // Remove fields MiniMax doesn't support
-        obj.remove("metadata");
-        obj.remove("service_tier");
-        obj.remove("thinking");
-        // MiniMax uses max_tokens, not max_completion_tokens
-        if let Some(max_comp) = obj.remove("max_completion_tokens") {
-            obj.entry("max_tokens").or_insert(max_comp);
-        }
-    }
-
-    serde_json::to_vec(&val).unwrap_or(sanitized)
-}
 
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
     if let Some(auth) = req.headers().get("authorization") {
@@ -673,7 +706,9 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            store.flush();
+            let store = store.clone();
+            // flush() does synchronous disk IO; keep it off Tokio worker threads.
+            let _ = tokio::task::spawn_blocking(move || store.flush()).await;
         }
     });
 

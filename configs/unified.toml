@@ -136,6 +136,7 @@ models = ["gpt-5.5", "gpt-5.4", "gpt-5.2", "gpt-5.1", "gpt-5-mini"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
+strip_params = ["thinking"]
 
 # Guidor后端：DeepSeek系列（已禁用：reasoning_content 多轮不兼容无状态 proxy）
 # [[backends]]
@@ -171,6 +172,7 @@ models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"
+strip_params = ["metadata", "service_tier", "thinking"]
 
 # MiniMax后端2（MINIMAX_API_KEY_2 不支持 highspeed）
 [[backends]]
@@ -182,3 +184,4 @@ models = ["MiniMax-M2.7", "MiniMax-M2.5"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"
+strip_params = ["metadata", "service_tier", "thinking"]
