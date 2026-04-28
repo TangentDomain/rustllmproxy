@@ -19,7 +19,6 @@ pub struct WeightedRoundRobin {
     retry_delay: Duration,
     // 加权随机用到的累积权重前缀和（缓存在 RwLock 里，unhealthy 变化时重建）
     selector: RwLock<Vec<(usize, u32)>>, // (backend_index, cumulative_weight)
-    rand_counter: AtomicU64,
     name_index: HashMap<String, usize>, // name → backends Vec index，O(1) 健康查找
 }
 
@@ -46,7 +45,6 @@ impl WeightedRoundRobin {
             retry,
             retry_delay,
             selector: RwLock::new(selector),
-            rand_counter: AtomicU64::new(0),
             name_index,
         }
     }
@@ -75,17 +73,13 @@ impl WeightedRoundRobin {
             return Err(anyhow!("无可用后端"));
         }
         let total = sel.last().map(|(_, w)| *w).unwrap_or(0);
-        let r = self.next_random() % total as u64;
+        let r = rand::random::<u64>() % total as u64;
 
         let pos = sel.partition_point(|(_, cum)| *cum as u64 <= r);
         let idx = if pos < sel.len() { sel[pos].0 } else { sel[0].0 };
         Ok(self.backends[idx].clone())
     }
 
-    /// 返回一个伪随机数（用于外部加权选择）
-    pub fn next_random(&self) -> u64 {
-        self.rand_counter.fetch_add(1, Ordering::Relaxed)
-    }
 
     /// 带重试的选择
     pub fn select_with_retry(&self) -> Result<Arc<BackendState>> {

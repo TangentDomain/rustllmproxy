@@ -132,7 +132,7 @@ impl Proxy {
             if group.len() == 1 {
                 group[0].clone()
             } else {
-                let idx = self.balancer().next_random() as usize % group.len();
+                let idx = rand::random::<usize>() % group.len();
                 group[idx].clone()
             }
         } else {
@@ -169,7 +169,7 @@ impl Proxy {
             let avg_w = weights.iter().filter(|&&w| w > 1.0).sum::<f64>() / weights.iter().filter(|&&w| w > 1.0).count().max(1) as f64;
             let weights: Vec<f64> = weights.iter().map(|&w| if w <= 1.0 { avg_w } else { w }).collect();
             let total_w: f64 = weights.iter().sum();
-            let r = (self.balancer().next_random() as f64) / (u64::MAX as f64) * total_w;
+            let r = rand::random::<f64>() * total_w;
             let mut cum = 0.0;
             let start = weights.iter().position(|w| { cum += w; cum >= r }).unwrap_or(0);
             for i in 0..healthy.len() {
