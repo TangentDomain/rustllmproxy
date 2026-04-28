@@ -1,0 +1,5 @@
+{
+  "model": "test-model",
+  "messages": [{"role": "user", "content": "hi"}],
+  "max_tokens": 5
+}

@@ -17,38 +17,43 @@ rate_limit = 999
 # ─── Fallback 链 ──────────────────────────────────────────
 
 [fallback]
-# 旗舰模型：只在旗舰/高端之间降级，不跌到中端
-"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7"]
-"glm-5v-turbo" = ["glm-5-turbo", "glm-5.1", "MiniMax-M2.7"]
-"glm-5-turbo"  = ["glm-5v-turbo", "glm-5.1", "MiniMax-M2.7"]
+# 高级模型（旗舰）→ 中级 → 低级
+"glm-5.1"           = ["gpt-5.5", "claude-opus-4-7", "deepseek-v4-pro"]
+"gpt-5.5"           = ["claude-opus-4-7", "glm-5.1", "deepseek-v4-pro"]
+"claude-opus-4-7"   = ["gpt-5.5", "glm-5.1", "deepseek-v4-pro"]
+"deepseek-v4-pro"   = ["glm-5.1", "gpt-5.5", "claude-opus-4-7"]
 
-# 中端模型：只在同级别降级，不跌到轻量
-"glm-4.7"      = ["MiniMax-M2.7", "glm-5-turbo", "MiniMax-M2.5"]
+# 中级模型（均衡）→ 低级
+"glm-5-turbo"       = ["glm-5v-turbo", "gpt-5.4", "deepseek-v4-flash"]
+"glm-5v-turbo"      = ["glm-5-turbo", "gpt-5.4", "claude-sonnet-4-6"]
+"claude-sonnet-4-6" = ["gpt-5.4", "glm-5v-turbo", "deepseek-v4-flash"]
+"gpt-5.4"          = ["gpt-5.5", "claude-sonnet-4-6", "glm-5-turbo"]
+"deepseek-v4-flash" = ["gpt-5.4", "glm-5-turbo", "MiniMax-M2.7"]
 
-# 轻量模型：互相兜底
-"glm-4.6"      = ["glm-4.7", "glm-4.5", "MiniMax-M2.5"]
-"glm-4.5"      = ["glm-4.6", "glm-4.7", "MiniMax-M2.5"]
-"glm-4.5-air"  = ["glm-4.5", "glm-4.6", "glm-4.7"]
-
-# MiniMax模型
-"MiniMax-M2.7"  = ["MiniMax-M2.5", "glm-5-turbo", "glm-4.7"]
-"MiniMax-M2.5"  = ["MiniMax-M2.7", "glm-4.7", "glm-4.6"]
-
-# Claude模型：同档降级
-"claude-opus-4-7"   = ["claude-sonnet-4-6", "claude-opus-4-6"]
-"claude-opus-4-6"   = ["claude-opus-4-7", "claude-sonnet-4-6"]
-"claude-sonnet-4-6" = ["claude-opus-4-7", "claude-opus-4-6"]
+# 低级模型（低成本）→ 兜底
+"glm-4.7"        = ["MiniMax-M2.7", "deepseek-v4-flash"]
+"MiniMax-M2.7"   = ["MiniMax-M2.7-highspeed", "glm-4.7", "deepseek-v4-flash"]
+"MiniMax-M2.7-highspeed" = ["MiniMax-M2.7", "glm-4.7"]
 
 # 兜底
-default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+default = ["glm-5.1", "gpt-5.5", "claude-opus-4-7", "deepseek-v4-pro", "glm-5v-turbo", "glm-5-turbo", "claude-sonnet-4-6", "gpt-5.4", "deepseek-v4-flash", "MiniMax-M2.7", "glm-4.7"]
+
 
 # ─── 模型映射 ────────────────────────────────────────────
 
 [model_mapping]
-"glm-5.1" = ["glm-5.1", "claude-opus-4-7", "claude-sonnet-4-6"]
-"glm-5-turbo" = ["glm-5-turbo", "claude-sonnet-4-6"]
-"glm-5v-turbo" = ["glm-5v-turbo", "claude-sonnet-4-6"]
-"glm-4.7" = ["glm-4.7", "glm-4.6", "MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
+
+# 高级模型：旗舰级
+"glm-5.1" = ["gpt-5.5", "claude-opus-4-7", "deepseek-v4-pro"]
+
+# 中级模型：均衡性能
+"glm-5-turbo" = ["gpt-5.4", "deepseek-v4-flash"]
+
+# 多模态模型：视觉/多模态
+"glm-5v-turbo" = ["claude-sonnet-4-6"]
+
+# 轻量模型：快速便宜
+"glm-4.7" = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "deepseek-v4-flash"]
 
 # ─── OpenAI 后端 ───────────────────────────────────────────
 
@@ -58,7 +63,7 @@ name = "zhipu-openai"
 url = "https://open.bigmodel.cn/api/coding/paas"
 api_key = "${ZHIPU_API_KEY}"
 weight = 10
-models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7"]
 timeout_secs = 300
 connect_timeout_secs = 10
 protocol = "openai"
@@ -69,7 +74,7 @@ name = "minimax-coding-1"
 url = "https://api.minimaxi.com"
 api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
+models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
@@ -79,7 +84,7 @@ name = "minimax-coding-2"
 url = "https://api.minimaxi.com"
 api_key = "${MINIMAX_API_KEY_2}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+models = ["MiniMax-M2.7"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
@@ -90,7 +95,29 @@ name = "guidor"
 url = "https://guidor.vip"
 api_key = "${GUIDOR_API_KEY}"
 weight = 10
-models = ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"]
+models = ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"]
+timeout_secs = 300
+connect_timeout_secs = 8
+protocol = "openai"
+
+# Guidor后端：GPT系列
+[[backends]]
+name = "guidor-gpt"
+url = "https://guidor.vip"
+api_key = "${GUIDOR_GPT_API_KEY}"
+weight = 10
+models = ["gpt-5.5", "gpt-5.4"]
+timeout_secs = 300
+connect_timeout_secs = 8
+protocol = "openai"
+
+# Guidor后端：DeepSeek系列
+[[backends]]
+name = "guidor-deepseek"
+url = "https://guidor.vip"
+api_key = "${GUIDOR_DEEPSEEK_API_KEY}"
+weight = 10
+models = ["deepseek-v4-pro", "deepseek-v4-flash"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
@@ -103,7 +130,7 @@ name = "zhipu-anthropic"
 url = "https://open.bigmodel.cn/api/anthropic"
 api_key = "${ZHIPU_API_KEY}"
 weight = 10
-models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7"]
 timeout_secs = 300
 connect_timeout_secs = 10
 protocol = "anthropic"
@@ -114,7 +141,7 @@ name = "minimax-anthropic-1"
 url = "https://api.minimaxi.com/anthropic"
 api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
+models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"
@@ -124,7 +151,7 @@ name = "minimax-anthropic-2"
 url = "https://api.minimaxi.com/anthropic"
 api_key = "${MINIMAX_API_KEY_2}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+models = ["MiniMax-M2.7"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"

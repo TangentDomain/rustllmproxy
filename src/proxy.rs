@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
@@ -17,13 +17,13 @@ use tracing::{info, warn, error};
 
 use crate::balancer::WeightedRoundRobin;
 use crate::config::{Config, Backend};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use parking_lot::RwLock;
 
 /// Per-backend tok/s rolling window for adaptive load balancing.
 /// Faster backends get more traffic automatically.
 pub struct BackendMetrics {
-    tok_per_sec: RwLock<HashMap<String, Vec<f64>>>,
+    tok_per_sec: RwLock<HashMap<String, VecDeque<f64>>>,
     window: usize,
 }
 
@@ -38,7 +38,7 @@ impl BackendMetrics {
         let mut map = self.tok_per_sec.write();
         let v = map.entry(backend.to_string()).or_default();
         v.push(tps);
-        if v.len() > self.window { v.remove(0); }
+        if v.len() > self.window { v.pop_front(); }
     }
 
     /// Rolling average tok/s for a backend. Returns 1.0 if no data (equal default weight).
@@ -132,7 +132,7 @@ impl Proxy {
             if group.len() == 1 {
                 group[0].clone()
             } else {
-                let idx = rand::random::<usize>() % group.len();
+                let idx = rand::thread_rng().gen_range(0..group.len());
                 group[idx].clone()
             }
         } else {
@@ -141,7 +141,8 @@ impl Proxy {
         if model != original_model {
             info!("Model mapping: {original_model} -> {model}");
         }
-        info!("Request model={model}, path={path}, protocol={:?}, body={body_size}B", protocol);
+        let max_tokens = extract_max_tokens(&bytes);
+        info!("Request model={model}, path={path}, protocol={:?}, body={body_size}B, max_tokens={max_tokens:?}", protocol);
 
         let chain = self.config.get_fallback_chain(&model);
 
@@ -166,7 +167,11 @@ impl Proxy {
             // Adaptive: weighted random by recent tok/s, faster backends get more traffic
             // Backends with no data get the average of those with data (proportional, no starvation)
             let weights: Vec<f64> = healthy.iter().map(|b| self.metrics.avg(&b.name)).collect();
-            let avg_w = weights.iter().filter(|&&w| w > 1.0).sum::<f64>() / weights.iter().filter(|&&w| w > 1.0).count().max(1) as f64;
+            let avg_w = if weights.iter().any(|&w| w > 1.0) {
+                weights.iter().filter(|&&w| w > 1.0).sum::<f64>() / weights.iter().filter(|&&w| w > 1.0).count() as f64
+            } else {
+                1.0 // no data yet → equal default weight
+            };
             let weights: Vec<f64> = weights.iter().map(|&w| if w <= 1.0 { avg_w } else { w }).collect();
             let total_w: f64 = weights.iter().sum();
             let r = rand::random::<f64>() * total_w;
@@ -195,7 +200,7 @@ impl Proxy {
                             resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
                             resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
                             // 后台等待 stream 结束打印日志
-                            let _ = done_rx;
+                            let _done_task = done_rx;
                             return resp;
                         } else {
                             // 非流式：直接返回，已经可以算总时间了
@@ -242,7 +247,7 @@ impl Proxy {
         } else {
             path.to_string()
         };
-        let url = format!("{}{}", backend.url.trim_end_matches('/'), forward_path);
+        let url = format!("{}/{}", backend.url.trim_end_matches('/'), forward_path.trim_start_matches('/'));
         info!("Forwarding to {} (backend={}, protocol={})", url, backend.name, backend.protocol);
 
         let t_backend = Instant::now();
@@ -391,6 +396,7 @@ pub async fn auth_layer(
 
 /// 从 JSON bytes 中快速提取 "model" 字段值（手动扫描，避免完整反序列化）
 /// 优化：只扫描前 2KB（model 字段始终在 JSON 开头附近）
+#[inline]
 fn extract_model_from_json(bytes: &[u8]) -> String {
     const PATTERN: &[u8] = b"\"model\"";
     // model 字段始终在 JSON 开头附近，只扫描前 2KB
@@ -413,9 +419,35 @@ fn extract_model_from_json(bytes: &[u8]) -> String {
     String::new()
 }
 
-/// 跳过空白字符（空格、tab、换行、回车）
+
+
+/// 从 JSON bytes 中快速提取 max_tokens / max_completion_tokens（手动扫描，避免完整反序列化）
+fn extract_max_tokens(bytes: &[u8]) -> Option<u32> {
+    // 扫描前 8KB（max_tokens 通常在 model 附近）
+    let scan_range = &bytes[..bytes.len().min(8192)];
+    const MAX_TOK: &[u8] = b"\"max_tokens\"";
+    const MAX_COMP_TOK: &[u8] = b"\"max_completion_tokens\"";
+    for key in [MAX_TOK, MAX_COMP_TOK] {
+        if let Some(pos) = scan_range.windows(key.len()).position(|w| w == key) {
+            let after_key = &bytes[pos + key.len()..];
+            let after_colon = skip_whitespace(after_key);
+            if !after_colon.is_empty() && after_colon[0] == b':' {
+                let after_colon = skip_whitespace(&after_colon[1..]);
+                if !after_colon.is_empty() && (after_colon[0].is_ascii_digit() || after_colon[0] == b'-') {
+                    let mut val: u32 = 0;
+                    for &b in after_colon.iter().take(10) {
+                        if b.is_ascii_digit() { val = val * 10 + (b - b'0') as u32; } else { break; }
+                    }
+                    return Some(val);
+                }
+            }
+        }
+    }
+    None
+}
+#[inline]
 fn skip_whitespace(s: &[u8]) -> &[u8] {
-    s.iter().position(|&c| c != b' ' && c != b'\t' && c != b'\n' && c != b'\r')
+    s.iter().position(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
         .map_or(&[], |i| &s[i..])
 }
 
@@ -498,7 +530,6 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
     info!("Listening on {addr}");
 
     // Periodic metrics flush (every 30s)
-    // Periodic metrics flush (every 30s)
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -552,6 +583,7 @@ fn instrument_stream(
         let mut content_text = String::with_capacity(8192);
         let mut backend_tokens: Option<u32> = None;
         let mut first_text_token: Option<Instant> = None;
+        let mut in_thinking = false;
         // Pre-allocate with generous capacity to avoid re-allocations during streaming
         let mut buffer = Vec::with_capacity(8192);
         loop {
@@ -586,6 +618,17 @@ fn instrument_stream(
                             if let Some(sse_data) = line.strip_prefix(b"data: ") {
                                 if sse_data != b"[DONE]" {
                                     if let Ok(text) = std::str::from_utf8(sse_data) {
+                                        // 检测 thinking 阶段
+                                        if !in_thinking && text.contains(r#""type":"thinking"#) {
+                                            in_thinking = true;
+                                            info!("[THINKING] Started on {} via {}", model, backend_name);
+                                        }
+                                        if in_thinking && (text.contains(r#""type":"content_block_stop"#) || text.contains(r#""content_block_stop"#)) {
+                                            if !text.contains(r#""type":"thinking"#) {
+                                                in_thinking = false;
+                                                info!("[THINKING] Ended on {} via {} (elapsed: {}ms)", model, backend_name, t_start.elapsed().as_millis());
+                                            }
+                                        }
                                         // Detect ttft
                                         if first_text_token.is_none() && (text.contains("\"text_delta\"") || text.contains("\"content\":\"") || text.contains("\"reasoning_content\":\"")) {
                                             first_text_token = Some(Instant::now());
@@ -613,7 +656,10 @@ fn instrument_stream(
                 }
 
                 // Forward Bytes directly (zero-copy, ref-counted Arc slice)
-                if tx.send(Ok(data)).await.is_err() { break; }
+                if tx.send(Ok(data)).await.is_err() {
+                    warn!("[STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", model, backend_name, content_text.len(), in_thinking);
+                    break;
+                }
             }
         }
 
@@ -698,9 +744,10 @@ fn extract_completion_tokens(json: &str) -> Option<u32> {
 
 /// Count tokens using tiktoken cl100k_base BPE encoding.
 /// Accurate for mixed Chinese/English text across most modern LLMs.
+/// BPE table is cached via OnceLock — init cost paid once, not per-request.
 fn count_tokens(text: &str) -> u32 {
-    use tiktoken_rs::cl100k_base;
-    let bpe = cl100k_base().expect("tiktoken init failed");
+    static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
+    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("tiktoken init failed"));
     bpe.encode_ordinary(text).len() as u32
 }
 
