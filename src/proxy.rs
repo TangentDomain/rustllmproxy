@@ -18,6 +18,7 @@ use tracing::{info, warn, error};
 use crate::balancer::WeightedRoundRobin;
 use crate::config::{Config, Backend};
 use std::collections::{HashMap, VecDeque};
+use rand::Rng;
 use parking_lot::RwLock;
 
 /// Per-backend tok/s rolling window for adaptive load balancing.
@@ -37,7 +38,7 @@ impl BackendMetrics {
         if tps <= 0.0 { return; }
         let mut map = self.tok_per_sec.write();
         let v = map.entry(backend.to_string()).or_default();
-        v.push(tps);
+        v.push_back(tps);
         if v.len() > self.window { v.pop_front(); }
     }
 
@@ -126,6 +127,10 @@ impl Proxy {
         };
 
         let model = extract_model_from_json(&bytes);
+        if model.trim().is_empty() {
+            info!("Rejecting request with missing or empty model field: path={path}, protocol={:?}", protocol);
+            return (StatusCode::BAD_REQUEST, "Missing or empty model field").into_response();
+        }
         let body_size = bytes.len();
         let original_model = model.clone();
         let model = if let Some(group) = self.config.model_mapping.get(&model) {
@@ -149,7 +154,7 @@ impl Proxy {
         for try_model in &chain {
             let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
             if all_backends.is_empty() {
-                warn!("No backend supports model={try_model}, skipping");
+                info!("No backend supports model={try_model}, skipping");
                 continue;
             }
 
@@ -158,7 +163,7 @@ impl Proxy {
                 .collect();
 
             if healthy.is_empty() {
-                warn!("No healthy backend for model={try_model}, skip to next model");
+                info!("No healthy backend for model={try_model}, skip to next model");
                 continue;
             }
 
@@ -180,12 +185,8 @@ impl Proxy {
             for i in 0..healthy.len() {
                 let selected = &healthy[(start + i) % healthy.len()];
                 let resolved = selected.resolve_model(try_model);
-                // Use Bytes directly when model unchanged (zero-copy via refcount), otherwise patch
-                let body_bytes: Bytes = if resolved == *try_model && *original_model == *try_model {
-                    bytes.clone() // Bytes::clone is O(1) refcount increment
-                } else {
-                    Bytes::from(patch_json_model(&bytes, &original_model, &resolved))
-                };
+                // Prepare body: model patch + backend-specific preprocessing
+                let body_bytes = prepare_request_body(&bytes, &original_model, try_model, &resolved, selected);
 
                 match self.do_forward(&path, &parts.headers, body_bytes, selected).await {
                     Ok((resp, ttfb, is_stream)) => {
@@ -211,20 +212,20 @@ impl Proxy {
                     }
                     Err(ForwardError::ClientError(status, body)) => {
                         let total_ms = t_start.elapsed().as_millis() as u64;
-                        warn!("Client error from {}: {} - returning directly ({}ms)", selected.name, status, total_ms);
+                        info!("Client error from {}: {} - returning directly ({}ms)", selected.name, status, total_ms);
                         return (status, body).into_response();
                     }
                     Err(ForwardError::RateLimited) => {
-                        warn!("{} rate limited (429), switching to next backend", selected.name);
+                        info!("{} rate limited (429), switching to next backend", selected.name);
                         continue;
                     }
                     Err(ForwardError::ServerErr(e)) => {
-                        warn!("{} server error: {}, trying next", selected.name, e);
+                        info!("{} server error: {}, trying next", selected.name, e);
                         continue;
                     }
                 }
             }
-            warn!("All backends exhausted for model={try_model}, falling back");
+            info!("All backends exhausted for model={try_model}, falling back");
         }
 
         let total_ms = t_start.elapsed().as_millis() as u64;
@@ -309,7 +310,7 @@ impl Proxy {
             // 400/403/404 等 → 后端能力不匹配，尝试下一个
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
-            warn!("{} returned {} (4xx), falling back: {}", backend.name, status, body_str);
+            info!("{} returned {} (4xx), falling back: {}", backend.name, status, body_str);
             Err(ForwardError::ServerErr(format!("{} returned {}: {}", backend.name, status, body_str)))
         } else {
             // 5xx 服务端错误 → 切换下一个后端
@@ -365,7 +366,7 @@ pub async fn auth_layer(
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("unknown");
 
-            warn!("Request missing auth: method={}, path={}, query={}, user_agent={}, real_ip={}",
+            info!("Request missing auth: method={}, path={}, query={}, user_agent={}, real_ip={}",
                 method, path, query, user_agent, real_ip);
             return Err(StatusCode::UNAUTHORIZED);
         }
@@ -384,7 +385,7 @@ pub async fn auth_layer(
     };
 
     if !proxy.limiter().check(&key, api_key.rate_limit) {
-        warn!("Rate limited: {}", api_key.name);
+        info!("Rate limited: {}", api_key.name);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -457,21 +458,160 @@ fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
     if old_model == new_model {
         return bytes.to_vec();
     }
-    let pattern = format!("\"model\":\"{old_model}\"");
+    let pattern = format!("\"model\"");
     let p = pattern.as_bytes();
-    // Find the match position first
-    let match_pos = bytes.windows(p.len()).position(|w| w == p);
-    let Some(match_pos) = match_pos else {
+    let Some(mut pos) = bytes.windows(p.len()).position(|w| w == p) else {
         return bytes.to_vec();
     };
-    // Build result: prefix + replacement + suffix (single allocation)
-    let replacement = format!("\"model\":\"{new_model}\"");
-    let r = replacement.as_bytes();
-    let mut result = Vec::with_capacity(match_pos + r.len() + (bytes.len() - match_pos - p.len()));
-    result.extend_from_slice(&bytes[..match_pos]);
-    result.extend_from_slice(r);
-    result.extend_from_slice(&bytes[match_pos + p.len()..]);
+    pos += p.len();
+
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    if pos >= bytes.len() || bytes[pos] != b':' {
+        return bytes.to_vec();
+    }
+    pos += 1;
+    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
+        pos += 1;
+    }
+    if pos >= bytes.len() || bytes[pos] != b'\"' {
+        return bytes.to_vec();
+    }
+    let value_start = pos + 1;
+    let mut value_end = value_start;
+    let mut escaped = false;
+    while value_end < bytes.len() {
+        let b = bytes[value_end];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'\"' {
+            break;
+        }
+        value_end += 1;
+    }
+
+    if value_end >= bytes.len() {
+        return bytes.to_vec();
+    }
+    if std::str::from_utf8(&bytes[value_start..value_end]).ok() != Some(old_model) {
+        return bytes.to_vec();
+    }
+
+    let mut result = Vec::with_capacity(bytes.len() + new_model.len().saturating_sub(old_model.len()));
+    result.extend_from_slice(&bytes[..value_start]);
+    result.extend_from_slice(new_model.as_bytes());
+    result.extend_from_slice(&bytes[value_end..]);
     result
+}
+
+/// Prepare request body: apply model patch, then backend-specific transforms.
+/// Preserves zero-copy path for unaffected backends (especially OpenAI).
+fn prepare_request_body(
+    bytes: &Bytes,
+    original_model: &str,
+    try_model: &str,
+    resolved: &str,
+    backend: &Backend,
+) -> Bytes {
+    let needs_model_patch = resolved != try_model || original_model != try_model;
+    let needs_special_transform = backend.protocol == "anthropic"
+        && (backend.name == "zhipu-anthropic" || backend.name.starts_with("minimax-anthropic"));
+
+    if !needs_model_patch && !needs_special_transform {
+        return bytes.clone();
+    }
+
+    let base: Vec<u8> = if needs_model_patch {
+        patch_json_model(bytes, original_model, resolved)
+    } else {
+        bytes.to_vec()
+    };
+
+    // Step 2: Backend-specific preprocessing (only Anthropic backends that need it)
+    if backend.protocol != "anthropic" {
+        return Bytes::from(base); // OpenAI: no transform
+    }
+
+    match backend.name.as_str() {
+        "zhipu-anthropic" => Bytes::from(sanitize_json_bytes(&base)),
+        name if name.starts_with("minimax-anthropic") => Bytes::from(filter_minimax_params(&base)),
+        _ => Bytes::from(base),
+    }
+}
+
+/// Sanitize JSON bytes: strip trailing commas, BOM, and re-serialize cleanly.
+/// Used for zhipu-anthropic which has a strict JSON parser that rejects trailing commas.
+fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
+    // Fast path: already valid JSON, just re-serialize for clean output
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
+        return serde_json::to_vec(&val).unwrap_or_else(|_| bytes.to_vec());
+    }
+
+    // Slow path: strip trailing commas then retry
+    let mut cleaned = Vec::with_capacity(bytes.len());
+    let mut in_string = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            cleaned.push(b);
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 1;
+                cleaned.push(bytes[i]);
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else {
+            match b {
+                b'"' => { in_string = true; cleaned.push(b); }
+                b',' => {
+                    // Look ahead: skip comma if followed by } or ]
+                    let mut j = i + 1;
+                    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') { j += 1; }
+                    if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
+                        // Trailing comma: skip it
+                    } else {
+                        cleaned.push(b);
+                    }
+                }
+                _ => cleaned.push(b),
+            }
+        }
+        i += 1;
+    }
+
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&cleaned) {
+        serde_json::to_vec(&val).unwrap_or(cleaned)
+    } else {
+        cleaned
+    }
+}
+
+/// Filter/transform Anthropic params for MiniMax compatibility.
+/// MiniMax's Anthropic-compatible API rejects certain Anthropic-specific fields.
+fn filter_minimax_params(bytes: &[u8]) -> Vec<u8> {
+    // First sanitize (strip trailing commas, etc.)
+    let sanitized = sanitize_json_bytes(bytes);
+    let mut val: serde_json::Value = match serde_json::from_slice(&sanitized) {
+        Ok(v) => v,
+        Err(_) => return sanitized,
+    };
+
+    if let Some(obj) = val.as_object_mut() {
+        // Remove fields MiniMax doesn't support
+        obj.remove("metadata");
+        obj.remove("service_tier");
+        obj.remove("thinking");
+        // MiniMax uses max_tokens, not max_completion_tokens
+        if let Some(max_comp) = obj.remove("max_completion_tokens") {
+            obj.entry("max_tokens").or_insert(max_comp);
+        }
+    }
+
+    serde_json::to_vec(&val).unwrap_or(sanitized)
 }
 
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
@@ -591,7 +731,8 @@ fn instrument_stream(
                 Ok(Some(result)) => result,
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
-                    warn!("Stream idle timeout ({}s) on {} via {}, aborting", stream_idle_timeout.as_secs(), model, backend_name);
+                    warn!("Stream idle timeout ({}s) on {} via {}, sending error to client", stream_idle_timeout.as_secs(), model, backend_name);
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Stream idle timeout after {}s", stream_idle_timeout.as_secs())))).await;
                     break;
                 }
             };
@@ -657,7 +798,7 @@ fn instrument_stream(
 
                 // Forward Bytes directly (zero-copy, ref-counted Arc slice)
                 if tx.send(Ok(data)).await.is_err() {
-                    warn!("[STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", model, backend_name, content_text.len(), in_thinking);
+                    info!("[STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", model, backend_name, content_text.len(), in_thinking);
                     break;
                 }
             }
@@ -682,7 +823,7 @@ fn instrument_stream(
 
         let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
         if slow {
-            warn!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
+            info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
         } else {
             info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
         }

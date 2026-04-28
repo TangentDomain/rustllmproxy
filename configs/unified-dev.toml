@@ -5,7 +5,7 @@ retry_delay_ms = 500
 [server]
 port = 8091
 timeout_secs = 300
-
+log_dir = "logs-dev"
 [auth]
 enabled = true
 

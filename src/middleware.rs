@@ -73,7 +73,7 @@ pub async fn auth_middleware(
     let key = match key {
         Some(k) => k,
         None => {
-            tracing::warn!("请求缺少认证信息");
+            tracing::info!("请求缺少认证信息");
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
@@ -90,7 +90,7 @@ pub async fn auth_middleware(
 
     // 限流检查
     if !state.limiter.check(&key, api_key.rate_limit) {
-        tracing::warn!("key [{}] 触发限流", api_key.name);
+        tracing::info!("key [{}] 触发限流", api_key.name);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
