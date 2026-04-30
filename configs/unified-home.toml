@@ -3,7 +3,7 @@ retry = 2
 retry_delay_ms = 500
 
 [server]
-port = 8092
+port = 8090
 timeout_secs = 300
 
 [auth]

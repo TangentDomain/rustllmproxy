@@ -10,9 +10,9 @@ echo "Starting Unified LLM Proxy (HOME)..."
 ./run-home/unified-proxy-home configs/unified-home.toml &
 
 sleep 3
-curl -s http://127.0.0.1:8092/health
+curl -s http://127.0.0.1:8090/health
 echo ""
-echo "Done. HOME Proxy running on :8092"
+echo "Done. HOME Proxy running on :8090"
 echo ""
-echo "  OpenAI:    http://localhost:8092/openai/v1/chat/completions"
-echo "  Anthropic: http://localhost:8092/anthropic/v1/messages"
+echo "  OpenAI:    http://localhost:8090/openai/v1/chat/completions"
+echo "  Anthropic: http://localhost:8090/anthropic/v1/messages"
