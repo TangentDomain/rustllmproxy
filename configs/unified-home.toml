@@ -1,0 +1,104 @@
+type = "unified"
+retry = 2
+retry_delay_ms = 500
+
+[server]
+port = 8092
+timeout_secs = 300
+
+[auth]
+enabled = true
+
+[[auth.keys]]
+key = "sk-proxy-default"
+name = "default"
+rate_limit = 999
+
+# ─── Fallback 链 ──────────────────────────────────────────
+
+[fallback]
+# 高级模型 → 中级
+"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo"]
+"glm-5v-turbo" = ["glm-5-turbo", "glm-4.7"]
+"glm-5-turbo"  = ["glm-4.7", "MiniMax-M2.7"]
+
+# 低级模型 → 兜底
+"glm-4.7"               = ["MiniMax-M2.7"]
+"MiniMax-M2.7"          = ["MiniMax-M2.7-highspeed", "glm-4.7"]
+"MiniMax-M2.7-highspeed" = ["MiniMax-M2.7", "glm-4.7"]
+
+default = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7"]
+
+# ─── 模型映射 ────────────────────────────────────────────
+
+[model_mapping]
+"glm-5.1"      = ["glm-5.1"]
+"glm-5v-turbo" = ["glm-5v-turbo"]
+"glm-5-turbo"  = ["glm-5-turbo"]
+"glm-4.7"      = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "glm-4.7"]
+
+# ─── OpenAI 后端 ───────────────────────────────────────────
+
+[[backends]]
+name = "zhipu-openai"
+url = "https://open.bigmodel.cn/api/coding/paas"
+api_key = "${ZHIPU_API_KEY}"
+weight = 10
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "glm-4.6"]
+timeout_secs = 300
+connect_timeout_secs = 10
+protocol = "openai"
+
+[[backends]]
+name = "minimax-coding-1"
+url = "https://api.minimaxi.com"
+api_key = "${MINIMAX_API_KEY_1}"
+weight = 10
+models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
+timeout_secs = 300
+connect_timeout_secs = 8
+protocol = "openai"
+
+[[backends]]
+name = "minimax-coding-2"
+url = "https://api.minimaxi.com"
+api_key = "${MINIMAX_API_KEY_2}"
+weight = 10
+models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+timeout_secs = 300
+connect_timeout_secs = 8
+protocol = "openai"
+
+# ─── Anthropic 后端 ─────────────────────────────────────────
+
+[[backends]]
+name = "zhipu-anthropic"
+url = "https://open.bigmodel.cn/api/anthropic"
+api_key = "${ZHIPU_API_KEY}"
+weight = 10
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "glm-4.6"]
+timeout_secs = 300
+connect_timeout_secs = 10
+protocol = "anthropic"
+
+[[backends]]
+name = "minimax-anthropic-1"
+url = "https://api.minimaxi.com/anthropic"
+api_key = "${MINIMAX_API_KEY_1}"
+weight = 10
+models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
+timeout_secs = 300
+connect_timeout_secs = 8
+protocol = "anthropic"
+strip_params = ["metadata", "service_tier", "thinking"]
+
+[[backends]]
+name = "minimax-anthropic-2"
+url = "https://api.minimaxi.com/anthropic"
+api_key = "${MINIMAX_API_KEY_2}"
+weight = 10
+models = ["MiniMax-M2.7", "MiniMax-M2.5"]
+timeout_secs = 300
+connect_timeout_secs = 8
+protocol = "anthropic"
+strip_params = ["metadata", "service_tier", "thinking"]
