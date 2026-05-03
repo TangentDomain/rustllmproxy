@@ -113,6 +113,7 @@ impl Proxy {
     /// - 不健康的后端直接跳过
     pub async fn handle(&self, req: Request<Body>) -> Response<Body> {
         let t_start = Instant::now();
+        let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
 
@@ -204,6 +205,11 @@ impl Proxy {
 
             info!("Trying model={}, healthy backends={}/{}", try_model, healthy.len(), all_backends.len());
 
+            if Instant::now() >= fallback_deadline {
+                warn!("Fallback deadline exceeded ({}s), aborting for model={}", self.config.server.fallback_timeout_secs, try_model);
+                break;
+            }
+
             // Adaptive: weighted random by recent tok/s, faster backends get more traffic
             // Backends with no data get the average of those with data (proportional, no starvation)
             let weights: Vec<f64> = healthy.iter().map(|b| self.metrics.avg(&b.name)).collect();
@@ -231,7 +237,8 @@ impl Proxy {
 
                         if is_stream {
                         let idle_timeout = Duration::from_secs(self.config.server.stream_idle_timeout_secs);
-                        let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout, self.metrics.clone(), self.store.clone());
+                        let first_chunk_timeout = Duration::from_secs(self.config.server.stream_first_chunk_timeout_secs);
+                        let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout, first_chunk_timeout, self.metrics.clone(), self.store.clone());
                             let mut resp = Response::new(new_body);
                             resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
                             resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
@@ -290,6 +297,7 @@ impl Proxy {
 
         let mut req_builder = self.client
             .post(&url)
+            .timeout(Duration::from_secs(backend.timeout_secs))
             .body(body);
 
         // 使用预计算的 auth_header（启动时生成，避免每次 format! 分配）
@@ -342,9 +350,16 @@ impl Proxy {
             let status_axum = StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED);
             Err(ForwardError::ClientError(status_axum, body_str.into_owned()))
         } else if code >= 400 && code < 500 {
-            // 400/403/404 等 → 后端能力不匹配，尝试下一个
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
+            // 422 Unprocessable Entity: 通常是请求参数校验失败（max_tokens超限、格式错误等）
+            // 换后端大概率一样失败，直接返回避免浪费时间
+            if code == 422 {
+                info!("{} returned 422 (param error), returning directly: {}", backend.name, body_str);
+                let status_axum = StatusCode::from_u16(code).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                return Err(ForwardError::ClientError(status_axum, body_str.into_owned()));
+            }
+            // 400/403/404/415 等 → 不同 provider 可能行为不同，值得 fallback
             info!("{} returned {} (4xx), falling back: {}", backend.name, status, body_str);
             Err(ForwardError::ServerErr(format!("{} returned {}: {}", backend.name, status, body_str)))
         } else {
@@ -746,6 +761,7 @@ fn instrument_stream(
     ttfb: Duration,
     t_start: Instant,
     stream_idle_timeout: Duration,
+    stream_first_chunk_timeout: Duration,
     metrics: Arc<BackendMetrics>,
     store: Arc<MetricsStore>,
     ) -> (Body, tokio::task::JoinHandle<()>) {
@@ -759,10 +775,19 @@ fn instrument_stream(
         let mut backend_tokens: Option<u32> = None;
         let mut first_text_token: Option<Instant> = None;
         let mut in_thinking = false;
+        let mut last_speed_check = Instant::now();
+        let mut tokens_at_last_check: usize = 0;
+        let mut slow_warning_sent = false;
         // Pre-allocate with generous capacity to avoid re-allocations during streaming
         let mut buffer = Vec::with_capacity(8192);
         loop {
-            let frame_result = match tokio::time::timeout(stream_idle_timeout, body.frame()).await {
+            // 分级超时：首个 chunk 用更长的超时，后续用更短的间隔超时
+            let idle_timeout = if first_text_token.is_none() {
+                stream_first_chunk_timeout
+            } else {
+                stream_idle_timeout
+            };
+            let frame_result = match tokio::time::timeout(idle_timeout, body.frame()).await {
                 Ok(Some(result)) => result,
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
@@ -813,6 +838,24 @@ fn instrument_stream(
                                         if let Some(s) = extract_content_text(text) { content_text.push_str(&s); }
                                         if let Some(n) = extract_completion_tokens(text) {
                                             backend_tokens = Some(n);
+                                        }
+                                        // 实时慢速检测：每 10s 采样一次 tok/s
+                                        let check_elapsed = last_speed_check.elapsed();
+                                        if check_elapsed >= Duration::from_secs(10) {
+                                            let current_token_count = content_text.len();
+                                            let recent_chars = current_token_count.saturating_sub(tokens_at_last_check);
+                                            let recent_tps = recent_chars as f64 / check_elapsed.as_secs_f64();
+                                            // 大约 4 chars per token, threshold ~1 tok/s = 4 chars/s
+                                            if recent_tps < 4.0 && recent_tps > 0.0 && !slow_warning_sent {
+                                                warn!(
+                                                    "[SLOW STREAM] {} via {}: ~{:.1} tok/s in last {:.0}s (total elapsed: {:.1}s)",
+                                                    model, backend_name, recent_tps / 4.0, check_elapsed.as_secs_f64(),
+                                                    t_start.elapsed().as_secs_f64()
+                                                );
+                                                slow_warning_sent = true;
+                                            }
+                                            tokens_at_last_check = current_token_count;
+                                            last_speed_check = Instant::now();
                                         }
                                     }
                                 }

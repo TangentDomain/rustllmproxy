@@ -6,11 +6,16 @@ use parking_lot::RwLock;
 use std::time::Duration;
 use anyhow::{anyhow, Result};
 
+/// Unhealthy 后端被动恢复冷却时间（毫秒）
+const RECOVERY_COOLDOWN_MS: u64 = 60_000;
+
 #[derive(Debug)]
 pub struct BackendState {
     pub backend: Backend,
     pub healthy: AtomicBool,
     pub fail_count: AtomicU64,
+    /// 标记为 unhealthy 的时间戳（毫秒），用于被动恢复
+    unhealthy_since: AtomicU64,
 }
 
 pub struct WeightedRoundRobin {
@@ -31,6 +36,7 @@ impl WeightedRoundRobin {
                     backend: b,
                     healthy: AtomicBool::new(true),
                     fail_count: AtomicU64::new(0),
+                    unhealthy_since: AtomicU64::new(0),
                 })
             })
             .collect();
@@ -102,6 +108,7 @@ impl WeightedRoundRobin {
         let was_unhealthy = !state.healthy.load(Ordering::Relaxed);
         state.fail_count.store(0, Ordering::Relaxed);
         state.healthy.store(true, Ordering::Relaxed);
+        state.unhealthy_since.store(0, Ordering::Relaxed);
         if was_unhealthy {
             tracing::info!("后端恢复: {}", state.backend.name);
             self.rebuild_selector();
@@ -113,6 +120,13 @@ impl WeightedRoundRobin {
         tracing::warn!("后端失败 ({fails}/3): {}", state.backend.name);
         if fails >= 3 {
             state.healthy.store(false, Ordering::Relaxed);
+            state.unhealthy_since.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                Ordering::Relaxed,
+            );
             tracing::error!("后端标记不健康: {}", state.backend.name);
             self.rebuild_selector();
         }
@@ -125,7 +139,29 @@ impl WeightedRoundRobin {
     /// O(1) 按名称查询后端健康状态
     pub fn is_healthy_by_name(&self, name: &str) -> bool {
         self.name_index.get(name).map_or(false, |&idx| {
-            self.backends[idx].healthy.load(Ordering::Relaxed)
+            let state = &self.backends[idx];
+            if state.healthy.load(Ordering::Relaxed) {
+                return true;
+            }
+            // 被动恢复：unhealthy 超过 60s 后自动恢复，允许试探
+            let since = state.unhealthy_since.load(Ordering::Relaxed);
+            if since == 0 {
+                return false;
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            if now_ms.saturating_sub(since) > RECOVERY_COOLDOWN_MS {
+                tracing::info!("后端被动恢复（超时 60s）: {}", state.backend.name);
+                state.fail_count.store(0, Ordering::Relaxed);
+                state.healthy.store(true, Ordering::Relaxed);
+                state.unhealthy_since.store(0, Ordering::Relaxed);
+                self.rebuild_selector();
+                true
+            } else {
+                false
+            }
         })
     }
 

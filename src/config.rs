@@ -25,11 +25,19 @@ pub struct ServerConfig {
     #[serde(default = "default_stream_idle_timeout")]
     /// 流式响应中两个 chunk 之间的最大空闲时间，超时则断开连接
     pub stream_idle_timeout_secs: u64,
+    /// 首个 SSE chunk 超时（默认 60s）
+    #[serde(default = "default_stream_first_chunk_timeout")]
+    pub stream_first_chunk_timeout_secs: u64,
+    /// fallback 链总超时（秒），超过则中止 fallback
+    #[serde(default = "default_fallback_timeout")]
+    pub fallback_timeout_secs: u64,
 }
 
 
 fn default_log_dir() -> String { "logs".to_string() }
 fn default_stream_idle_timeout() -> u64 { 120 }
+fn default_stream_first_chunk_timeout() -> u64 { 60 }
+fn default_fallback_timeout() -> u64 { 300 }
 
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
@@ -210,7 +218,7 @@ mod tests {
 
     fn make_config(fallback: HashMap<String, Vec<String>>, backends: Vec<Backend>) -> Config {
         Config {
-            server: ServerConfig { port: 8091, timeout_secs: 30, log_dir: "logs".to_string(), stream_idle_timeout_secs: 120 },
+            server: ServerConfig { port: 8091, timeout_secs: 30, log_dir: "logs".to_string(), stream_idle_timeout_secs: 120, stream_first_chunk_timeout_secs: 60, fallback_timeout_secs: 300 },
             r#type: "openai".to_string(),
             auth: AuthConfig { enabled: false, keys: vec![] },
             backends,
