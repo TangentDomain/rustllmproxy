@@ -6,6 +6,7 @@ retry_delay_ms = 500
 port = 8091
 timeout_secs = 300
 log_dir = "logs-dev"
+
 [auth]
 enabled = true
 
@@ -17,59 +18,44 @@ rate_limit = 999
 # ─── Fallback 链 ──────────────────────────────────────────
 
 [fallback]
-# 旗舰模型：只在旗舰/高端之间降级，不跌到中端
-"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7"]
-"glm-5v-turbo" = ["glm-5-turbo", "glm-5.1", "MiniMax-M2.7"]
-"glm-5-turbo"  = ["glm-5v-turbo", "glm-5.1", "MiniMax-M2.7"]
+# 高级模型 → 中级
+"glm-5.1"      = ["glm-5v-turbo", "glm-5-turbo"]
+"glm-5v-turbo" = ["glm-5-turbo", "glm-4.7"]
+"glm-5-turbo"  = ["glm-4.7", "MiniMax-M2.7"]
 
-# 中端模型：只在同级别降级，不跌到轻量
-"glm-4.7"      = ["MiniMax-M2.7", "glm-5-turbo", "MiniMax-M2.5"]
+# 低级模型 → 兜底
+"glm-4.7"               = ["MiniMax-M2.7"]
+"MiniMax-M2.7"          = ["MiniMax-M2.7-highspeed", "glm-4.7"]
+"MiniMax-M2.7-highspeed" = ["MiniMax-M2.7", "glm-4.7"]
 
-# 轻量模型：互相兜底
-"glm-4.6"      = ["glm-4.7", "glm-4.5", "MiniMax-M2.5"]
-"glm-4.5"      = ["glm-4.6", "glm-4.7", "MiniMax-M2.5"]
-"glm-4.5-air"  = ["glm-4.5", "glm-4.6", "glm-4.7"]
-
-# MiniMax模型
-"MiniMax-M2.7"  = ["MiniMax-M2.5", "glm-5-turbo", "glm-4.7"]
-"MiniMax-M2.5"  = ["MiniMax-M2.7", "glm-4.7", "glm-4.6"]
-
-# Claude模型：同档降级
-"claude-opus-4-7"   = ["claude-sonnet-4-6", "claude-opus-4-6"]
-"claude-opus-4-6"   = ["claude-opus-4-7", "claude-sonnet-4-6"]
-"claude-sonnet-4-6" = ["claude-opus-4-7", "claude-opus-4-6"]
-
-# 兜底
-default          = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7", "MiniMax-M2.5", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+default = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "MiniMax-M2.7", "glm-4.7"]
 
 # ─── 模型映射 ────────────────────────────────────────────
 
 [model_mapping]
-"glm-5.1" = ["glm-5.1", "claude-opus-4-7", "claude-sonnet-4-6"]
-"glm-5-turbo" = ["glm-5-turbo", "glm-5.1", "claude-sonnet-4-6"]
-"glm-5v-turbo" = ["glm-5v-turbo", "claude-sonnet-4-6"]
-"glm-4.7" = ["glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air", "MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
+"glm-5.1"      = ["glm-5.1"]
+"glm-5v-turbo" = ["glm-5v-turbo"]
+"glm-5-turbo"  = ["glm-5-turbo"]
+"glm-4.7"      = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "glm-4.7"]
 
 # ─── OpenAI 后端 ───────────────────────────────────────────
 
-# 智谱后端：支持所有GLM模型
 [[backends]]
 name = "zhipu-openai"
 url = "https://open.bigmodel.cn/api/coding/paas"
 api_key = "${ZHIPU_API_KEY}"
 weight = 10
-models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "glm-4.6"]
 timeout_secs = 300
 connect_timeout_secs = 10
 protocol = "openai"
 
-# MiniMax后端1（两个key负载均衡）
 [[backends]]
 name = "minimax-coding-1"
 url = "https://api.minimaxi.com"
 api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
+models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
@@ -84,40 +70,28 @@ timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "openai"
 
-# Guidor后端：Claude系列
-[[backends]]
-name = "guidor"
-url = "https://guidor.vip"
-api_key = "${GUIDOR_API_KEY}"
-weight = 10
-models = ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6"]
-timeout_secs = 300
-connect_timeout_secs = 8
-protocol = "openai"
-
 # ─── Anthropic 后端 ─────────────────────────────────────────
 
-# 智谱 Anthropic 后端：GLM 系列
 [[backends]]
 name = "zhipu-anthropic"
 url = "https://open.bigmodel.cn/api/anthropic"
 api_key = "${ZHIPU_API_KEY}"
 weight = 10
-models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-5", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air"]
+models = ["glm-5.1", "glm-5v-turbo", "glm-5-turbo", "glm-4.7", "glm-4.6"]
 timeout_secs = 300
 connect_timeout_secs = 10
 protocol = "anthropic"
 
-# MiniMax后端1（两个key负载均衡）
 [[backends]]
 name = "minimax-anthropic-1"
 url = "https://api.minimaxi.com/anthropic"
 api_key = "${MINIMAX_API_KEY_1}"
 weight = 10
-models = ["MiniMax-M2.7", "MiniMax-M2.5", "MiniMax-M2.7-highspeed", "MiniMax-M2.5-highspeed"]
+models = ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M2.5", "MiniMax-M2.5-highspeed"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"
+strip_params = ["metadata", "service_tier", "thinking"]
 
 [[backends]]
 name = "minimax-anthropic-2"
@@ -128,3 +102,4 @@ models = ["MiniMax-M2.7", "MiniMax-M2.5"]
 timeout_secs = 300
 connect_timeout_secs = 8
 protocol = "anthropic"
+strip_params = ["metadata", "service_tier", "thinking"]
