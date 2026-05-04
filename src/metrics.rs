@@ -135,6 +135,21 @@ impl MetricsStore {
             }
         }
     }
+
+    /// 清理长时间无新数据的 entry，防止 DashMap 键空间无限增长。
+    /// 保留最近 max_age_secs 秒内有数据的 entry，删除其余的。
+    pub fn evict_stale(&self, max_age_secs: u64) {
+        let cutoff = chrono::Local::now()
+            - chrono::Duration::seconds(max_age_secs as i64);
+        let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
+        self.data.retain(|_, samples| {
+            // 保留最后一个 sample 时间在 cutoff 之后的 entry
+            samples.last()
+                .map(|s| s.time > cutoff_str)
+                .unwrap_or(false)
+        });
+    }
+
 }
 
 fn sanitize_filename(s: &str) -> String {

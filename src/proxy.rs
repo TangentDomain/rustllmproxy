@@ -13,7 +13,7 @@ use reqwest::Client;
 use tokio::signal;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, info_span};
 
 use crate::balancer::WeightedRoundRobin;
 use crate::config::{Config, Backend};
@@ -80,6 +80,10 @@ impl Proxy {
             .pool_max_idle_per_host(50)
             .pool_idle_timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(3))
+            .tcp_keepalive(Duration::from_secs(60))
+            .tcp_keepalive_interval(Duration::from_secs(15))
+            .tcp_keepalive_retries(3)
+            .tcp_nodelay(true)
             .build()
             .expect("failed to build reqwest client");
         let log_dir = config.server.log_dir.clone();
@@ -112,6 +116,12 @@ impl Proxy {
     /// - 连接超时(5s)快速失败 → 切换下一个后端
     /// - 不健康的后端直接跳过
     pub async fn handle(&self, req: Request<Body>) -> Response<Body> {
+        let request_id = format!("{:016x}", rand::random::<u64>());
+        let span = info_span!("req", id = %request_id);
+        let _enter = span.enter();
+
+        let t_start = Instant::now();
+        let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
         let t_start = Instant::now();
         let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
         let (parts, body) = req.into_parts();
@@ -236,19 +246,25 @@ impl Proxy {
                             try_model, resolved, selected.name, ttfb_ms, body_size, is_stream);
 
                         if is_stream {
-                        let idle_timeout = Duration::from_secs(self.config.server.stream_idle_timeout_secs);
-                        let first_chunk_timeout = Duration::from_secs(self.config.server.stream_first_chunk_timeout_secs);
-                        let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout, first_chunk_timeout, self.metrics.clone(), self.store.clone());
+                            let idle_timeout = Duration::from_secs(self.config.server.stream_idle_timeout_secs);
+                            let first_chunk_timeout = Duration::from_secs(self.config.server.stream_first_chunk_timeout_secs);
+                            let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout, first_chunk_timeout, self.metrics.clone(), self.store.clone(), request_id.clone());
                             let mut resp = Response::new(new_body);
                             resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
                             resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
-                            // 后台等待 stream 结束打印日志
+                            resp.headers_mut().insert("x-request-id", request_id.parse().unwrap());
+                            resp.headers_mut().insert("x-backend", selected.name.parse().unwrap());
+                            resp.headers_mut().insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
                             let _done_task = done_rx;
                             return resp;
                         } else {
-                            // 非流式：直接返回，已经可以算总时间了
                             let total_ms = t_start.elapsed().as_millis() as u64;
                             info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms", model, resolved, selected.name, total_ms, ttfb_ms);
+                            let mut resp = resp;
+                            resp.headers_mut().insert("x-request-id", request_id.parse().unwrap());
+                            resp.headers_mut().insert("x-backend", selected.name.parse().unwrap());
+                            resp.headers_mut().insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
+                            resp.headers_mut().insert("x-total-ms", total_ms.to_string().parse().unwrap());
                             return resp;
                         }
                     }
@@ -272,7 +288,18 @@ impl Proxy {
 
         let total_ms = t_start.elapsed().as_millis() as u64;
         error!("All models exhausted for original model={model} ({}ms)", total_ms);
-        (StatusCode::SERVICE_UNAVAILABLE, "All backends exhausted").into_response()
+        let mut resp = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({
+                "error": "All backends exhausted",
+                "original_model": original_model,
+                "resolved_model": model,
+                "elapsed_ms": total_ms,
+                "request_id": request_id,
+            })),
+        ).into_response();
+        resp.headers_mut().insert("x-request-id", request_id.parse().unwrap());
+        resp
     }
 
     /// 转发请求到指定后端，返回分类后的错误
@@ -717,17 +744,33 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
 
     info!("Listening on {addr}");
 
-    // Periodic metrics flush (every 30s)
+    // Periodic metrics flush + stale entry cleanup (every 30s)
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let store = store.clone();
             // flush() does synchronous disk IO; keep it off Tokio worker threads.
-            let _ = tokio::task::spawn_blocking(move || store.flush()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                store.flush();
+                // 清理 24h 无新数据的 entry，防止 DashMap 键空间无限增长
+                store.evict_stale(24 * 3600);
+            }).await;
         }
     });
 
-    let listener = tokio::net::TcpListener::bind(addr).await.expect("bind failed");
+    let socket2_addr = socket2::SockAddr::from(addr);
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
+        .expect("failed to create socket");
+    socket.set_reuse_address(true).expect("failed to set reuse_address");
+    socket.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(15)),
+    ).expect("failed to set tcp keepalive");
+    socket.bind(&socket2_addr).expect("failed to bind");
+    socket.listen(1024).expect("failed to listen");
+    let std_listener: std::net::TcpListener = socket.into();
+    let listener = tokio::net::TcpListener::from_std(std_listener).expect("failed to convert to tokio listener");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
@@ -764,7 +807,9 @@ fn instrument_stream(
     stream_first_chunk_timeout: Duration,
     metrics: Arc<BackendMetrics>,
     store: Arc<MetricsStore>,
-    ) -> (Body, tokio::task::JoinHandle<()>) {
+    request_id: String,
+) -> (Body, tokio::task::JoinHandle<()>) {
+    let rid = request_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
     let done = tokio::spawn(async move {
@@ -791,7 +836,7 @@ fn instrument_stream(
                 Ok(Some(result)) => result,
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
-                    warn!("Stream idle timeout ({}s) on {} via {}, sending error to client", stream_idle_timeout.as_secs(), model, backend_name);
+                    warn!("[{}] Stream idle timeout ({}s) on {} via {}, sending error to client", rid, stream_idle_timeout.as_secs(), model, backend_name);
                     let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Stream idle timeout after {}s", stream_idle_timeout.as_secs())))).await;
                     break;
                 }
@@ -822,12 +867,12 @@ fn instrument_stream(
                                         // 检测 thinking 阶段
                                         if !in_thinking && text.contains(r#""type":"thinking"#) {
                                             in_thinking = true;
-                                            info!("[THINKING] Started on {} via {}", model, backend_name);
+                                            info!("[{}] [THINKING] Started on {} via {}", rid, model, backend_name);
                                         }
                                         if in_thinking && (text.contains(r#""type":"content_block_stop"#) || text.contains(r#""content_block_stop"#)) {
                                             if !text.contains(r#""type":"thinking"#) {
                                                 in_thinking = false;
-                                                info!("[THINKING] Ended on {} via {} (elapsed: {}ms)", model, backend_name, t_start.elapsed().as_millis());
+                                                info!("[{}] [THINKING] Ended on {} via {} (elapsed: {}ms)", rid, model, backend_name, t_start.elapsed().as_millis());
                                             }
                                         }
                                         // Detect ttft
@@ -848,7 +893,8 @@ fn instrument_stream(
                                             // 大约 4 chars per token, threshold ~1 tok/s = 4 chars/s
                                             if recent_tps < 4.0 && recent_tps > 0.0 && !slow_warning_sent {
                                                 warn!(
-                                                    "[SLOW STREAM] {} via {}: ~{:.1} tok/s in last {:.0}s (total elapsed: {:.1}s)",
+                                                    "[{}] [SLOW STREAM] {} via {}: ~{:.1} tok/s in last {:.0}s (total elapsed: {:.1}s)",
+                                                    rid,
                                                     model, backend_name, recent_tps / 4.0, check_elapsed.as_secs_f64(),
                                                     t_start.elapsed().as_secs_f64()
                                                 );
@@ -876,7 +922,7 @@ fn instrument_stream(
 
                 // Forward Bytes directly (zero-copy, ref-counted Arc slice)
                 if tx.send(Ok(data)).await.is_err() {
-                    info!("[STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", model, backend_name, content_text.len(), in_thinking);
+                    info!("[{}] [STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", rid, model, backend_name, content_text.len(), in_thinking);
                     break;
                 }
             }
@@ -901,9 +947,9 @@ fn instrument_stream(
 
         let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
         if slow {
-            info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
+            info!("[{}] Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", rid, model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
         } else {
-            info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
+            info!("[{}] Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", rid, model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
         }
     });
 
