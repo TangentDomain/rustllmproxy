@@ -943,7 +943,7 @@ fn instrument_stream(
         } else { 0.0 };
 
         metrics.record(&backend_name, tokens_per_sec);
-        store.record(&backend_name, &model, tokens_per_sec, ttfb_ms, ttft_ms, total_ms, output_tokens);
+        store.record(&backend_name, &resolved, tokens_per_sec, ttfb_ms, ttft_ms, total_ms, output_tokens);
 
         let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
         if slow {

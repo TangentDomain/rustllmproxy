@@ -34,7 +34,7 @@ async fn main() {
         .with(
             tracing_subscriber::fmt::Layer::new()
                 .with_writer(std::io::stdout)
-                .with_ansi(true)
+                .with_ansi(atty::is(atty::Stream::Stdout))
                 .with_target(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
         )
