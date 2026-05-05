@@ -25,4 +25,5 @@ Thumbs.db
 *.log
 logs/
 run-dev/
+run-home/
 logs-mock/
