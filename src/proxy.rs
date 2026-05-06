@@ -122,8 +122,6 @@ impl Proxy {
 
         let t_start = Instant::now();
         let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
-        let t_start = Instant::now();
-        let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
         let (parts, body) = req.into_parts();
         let path = parts.uri.path().to_string();
 
@@ -758,19 +756,12 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
         }
     });
 
-    let socket2_addr = socket2::SockAddr::from(addr);
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, Some(socket2::Protocol::TCP))
-        .expect("failed to create socket");
-    socket.set_reuse_address(true).expect("failed to set reuse_address");
-    socket.set_tcp_keepalive(
-        &socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(60))
-            .with_interval(Duration::from_secs(15)),
-    ).expect("failed to set tcp keepalive");
-    socket.bind(&socket2_addr).expect("failed to bind");
-    socket.listen(1024).expect("failed to listen");
-    let std_listener: std::net::TcpListener = socket.into();
-    let listener = tokio::net::TcpListener::from_std(std_listener).expect("failed to convert to tokio listener");
+    use tokio::net::TcpSocket;
+    let tcp_socket = TcpSocket::new_v4().expect("failed to create TCP socket");
+    tcp_socket.set_reuseaddr(true).expect("failed to set reuseaddr");
+    tcp_socket.set_keepalive(true).expect("failed to set keepalive");
+    tcp_socket.bind(addr).expect("failed to bind");
+    let listener = tcp_socket.listen(1024).expect("failed to listen");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
