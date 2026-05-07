@@ -839,7 +839,7 @@ pub async fn run_server_with_listener(
     config: Config,
     extra_routes: Router<Arc<Proxy>>,
     listener: tokio::net::TcpListener,
-) {
+ ) {
     let config = Arc::new(config);
     let balancer = Arc::new(WeightedRoundRobin::new(
         config.backends.clone(),
@@ -852,6 +852,23 @@ pub async fn run_server_with_listener(
     // Start health check
     balancer.start_health_check(Duration::from_secs(30));
 
+    let app = build_app(proxy.clone(), extra_routes);
+    start_metrics_maintenance_task(proxy.store.clone());
+
+    info!("Listening on {addr}");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+}
+
+/// 构建 axum Router：public(/health) + protected(/backends + extra_routes + fallback) + layers + state
+///
+/// 注意：行为必须与 run_server_with_listener 之前保持一致：
+/// - /health 必须公开（无 auth）
+/// - protected_routes 必须挂载 auth_layer，并使用 Arc<Proxy> 作为 state
+/// - TraceLayer/CorsLayer 的层级顺序保持不变
+fn build_app(proxy: Arc<Proxy>, extra_routes: Router<Arc<Proxy>>) -> Router {
     // 公共路由（不需要认证）
     let public_routes = Router::new().route(
         "/health",
@@ -870,16 +887,18 @@ pub async fn run_server_with_listener(
             auth_layer,
         ));
 
-    let store = proxy.store.clone();
-    let app = public_routes
+    public_routes
         .merge(protected_routes)
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
-        .with_state(proxy);
+        .with_state(proxy)
+}
 
-    info!("Listening on {addr}");
-
-    // Periodic metrics flush + stale entry cleanup (every 30s)
+/// 周期性 metrics flush + 过期清理（每 30s）
+///
+/// - flush() 为同步磁盘 IO，必须放到 spawn_blocking
+/// - 清理 24h 无新数据的 entry，防止 DashMap 键空间无限增长
+fn start_metrics_maintenance_task(store: Arc<MetricsStore>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -887,17 +906,11 @@ pub async fn run_server_with_listener(
             // flush() does synchronous disk IO; keep it off Tokio worker threads.
             let _ = tokio::task::spawn_blocking(move || {
                 store.flush();
-                // 清理 24h 无新数据的 entry，防止 DashMap 键空间无限增长
                 store.evict_stale(24 * 3600);
             })
             .await;
         }
     });
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
 }
 
 fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
