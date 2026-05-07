@@ -313,6 +313,9 @@ impl Proxy {
                             let first_chunk_timeout = Duration::from_secs(
                                 self.config.server.stream_first_chunk_timeout_secs,
                             );
+                            let stream_total_timeout = Duration::from_secs(
+                                self.config.server.timeout_secs,
+                            );
                             let (new_body, done_rx) = instrument_stream(
                                 resp.into_body(),
                                 model.clone(),
@@ -322,6 +325,7 @@ impl Proxy {
                                 t_start,
                                 idle_timeout,
                                 first_chunk_timeout,
+                                stream_total_timeout,
                                 self.metrics.clone(),
                                 self.store.clone(),
                                 request_id.clone(),
@@ -865,6 +869,16 @@ fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
 // --- Shared server runner ---
 
 pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
+    let addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
+    let listener = bind_listener(addr);
+    run_server_with_listener(config, extra_routes, listener).await;
+}
+
+pub async fn run_server_with_listener(
+    config: Config,
+    extra_routes: Router<Arc<Proxy>>,
+    listener: tokio::net::TcpListener,
+) {
     let config = Arc::new(config);
     let balancer = Arc::new(WeightedRoundRobin::new(
         config.backends.clone(),
@@ -872,7 +886,7 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
         Duration::from_millis(config.retry_delay_ms),
     ));
     let proxy = Arc::new(Proxy::new(config.clone(), balancer.clone()));
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server.port));
+    let addr = listener.local_addr().expect("failed to read listener addr");
 
     // Start health check
     balancer.start_health_check(Duration::from_secs(30));
@@ -919,7 +933,15 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
         }
     });
 
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await
+        .expect("server error");
+}
+
+fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
     use tokio::net::TcpSocket;
+
     let tcp_socket = TcpSocket::new_v4().expect("failed to create TCP socket");
     tcp_socket
         .set_reuseaddr(true)
@@ -928,11 +950,7 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
         .set_keepalive(true)
         .expect("failed to set keepalive");
     tcp_socket.bind(addr).expect("failed to bind");
-    let listener = tcp_socket.listen(1024).expect("failed to listen");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    tcp_socket.listen(1024).expect("failed to listen")
 }
 
 async fn backends_handler(State(proxy): State<Arc<Proxy>>) -> axum::Json<serde_json::Value> {
@@ -977,9 +995,6 @@ async fn shutdown_signal() {
 
     info!("Shutting down on {}...", signal_name);
 }
-
-/// 包裹 stream body，追踪 token 数量，完成后打印完整性能指标。
-/// 优化：使用 copy_in_place 压缩 + Bytes 零拷贝转发 + 预分配缓冲区。
 #[allow(clippy::too_many_arguments)]
 fn instrument_stream(
     body: Body,
@@ -990,6 +1005,7 @@ fn instrument_stream(
     t_start: Instant,
     stream_idle_timeout: Duration,
     stream_first_chunk_timeout: Duration,
+    stream_total_timeout: Duration,
     metrics: Arc<BackendMetrics>,
     store: Arc<MetricsStore>,
     request_id: String,
@@ -1008,38 +1024,58 @@ fn instrument_stream(
         let mut last_speed_check = Instant::now();
         let mut tokens_at_last_check: usize = 0;
         let mut slow_warning_sent = false;
-        // Pre-allocate with generous capacity to avoid re-allocations during streaming
         let mut buffer = Vec::with_capacity(8192);
+        let mut effective_chunk_seen = false;
+        let mut last_effective_activity = tokio::time::Instant::now();
+        let stream_total_deadline = tokio::time::Instant::now() + stream_total_timeout;
+
         loop {
-            // 分级超时：首个 chunk 用更长的超时，后续用更短的间隔超时
-            let idle_timeout = if first_text_token.is_none() {
-                stream_first_chunk_timeout
-            } else {
+            let idle_timeout = if effective_chunk_seen {
                 stream_idle_timeout
+            } else {
+                stream_first_chunk_timeout
             };
-            let frame_result = match tokio::time::timeout(idle_timeout, body.frame()).await {
+            let idle_deadline = last_effective_activity + idle_timeout;
+            let deadline = std::cmp::min(idle_deadline, stream_total_deadline);
+
+            let frame_result = match tokio::time::timeout_at(deadline, body.frame()).await {
                 Ok(Some(result)) => result,
-                Ok(None) => break, // stream 正常结束
+                Ok(None) => break,
                 Err(_) => {
-                    warn!(
-                        "[{}] Stream idle timeout ({}s) on {} via {}, sending error to client",
-                        rid,
-                        stream_idle_timeout.as_secs(),
-                        model,
-                        backend_name
-                    );
-                    let _ = tx
-                        .send(Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            format!(
-                                "Stream idle timeout after {}s",
-                                stream_idle_timeout.as_secs()
-                            ),
-                        )))
-                        .await;
+                    let now = tokio::time::Instant::now();
+                    if now >= stream_total_deadline {
+                        warn!(
+                            "[{}] Stream total timeout ({}s) on {} via {}, sending error to client",
+                            rid,
+                            stream_total_timeout.as_secs(),
+                            model,
+                            backend_name
+                        );
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("Stream total timeout after {}s", stream_total_timeout.as_secs()),
+                            )))
+                            .await;
+                    } else {
+                        warn!(
+                            "[{}] Stream idle timeout ({}s) on {} via {}, sending error to client",
+                            rid,
+                            idle_timeout.as_secs(),
+                            model,
+                            backend_name
+                        );
+                        let _ = tx
+                            .send(Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                format!("Stream idle timeout after {}s", idle_timeout.as_secs()),
+                            )))
+                            .await;
+                    }
                     break;
                 }
             };
+
             let frame = match frame_result {
                 Ok(f) => f,
                 Err(e) => {
@@ -1050,9 +1086,9 @@ fn instrument_stream(
 
             if let Ok(data) = frame.into_data() {
                 buffer.extend_from_slice(&data);
+                let mut newline_idx = 0usize;
+                let mut saw_effective_chunk = false;
 
-                // Scan for complete SSE lines using memchr for SIMD-accelerated newline search
-                let mut newline_idx = 0;
                 while newline_idx < buffer.len() {
                     let remaining = &buffer[newline_idx..];
                     match memchr::memchr(b'\n', remaining) {
@@ -1062,8 +1098,8 @@ fn instrument_stream(
 
                             if let Some(sse_data) = line.strip_prefix(b"data: ") {
                                 if sse_data != b"[DONE]" {
+                                    saw_effective_chunk = true;
                                     if let Ok(text) = std::str::from_utf8(sse_data) {
-                                        // 检测 thinking 阶段
                                         if !in_thinking && text.contains(r#""type":"thinking"#) {
                                             in_thinking = true;
                                             info!(
@@ -1079,7 +1115,6 @@ fn instrument_stream(
                                             in_thinking = false;
                                             info!("[{}] [THINKING] Ended on {} via {} (elapsed: {}ms)", rid, model, backend_name, t_start.elapsed().as_millis());
                                         }
-                                        // Detect ttft
                                         if first_text_token.is_none()
                                             && (text.contains("\"text_delta\"")
                                                 || text.contains("\"content\":\"")
@@ -1087,20 +1122,17 @@ fn instrument_stream(
                                         {
                                             first_text_token = Some(Instant::now());
                                         }
-                                        // Accumulate content text for token counting
                                         append_content_text(text, &mut content_text);
                                         if let Some(n) = extract_completion_tokens(text) {
                                             backend_tokens = Some(n);
                                         }
-                                        // 实时慢速检测：每 10s 采样一次 tok/s
                                         let check_elapsed = last_speed_check.elapsed();
                                         if check_elapsed >= Duration::from_secs(10) {
                                             let current_token_count = content_text.len();
                                             let recent_chars = current_token_count
                                                 .saturating_sub(tokens_at_last_check);
-                                            let recent_tps =
-                                                recent_chars as f64 / check_elapsed.as_secs_f64();
-                                            // 大约 4 chars per token, threshold ~1 tok/s = 4 chars/s
+                                            let recent_tps = recent_chars as f64
+                                                / check_elapsed.as_secs_f64();
                                             if recent_tps < 4.0
                                                 && recent_tps > 0.0
                                                 && !slow_warning_sent
@@ -1124,7 +1156,6 @@ fn instrument_stream(
                     }
                 }
 
-                // In-place compaction: shift unprocessed bytes to front, avoiding new Vec allocation
                 if newline_idx > 0 {
                     let remaining = buffer.len() - newline_idx;
                     if remaining > 0 {
@@ -1133,7 +1164,11 @@ fn instrument_stream(
                     buffer.truncate(remaining);
                 }
 
-                // Forward Bytes directly (zero-copy, ref-counted Arc slice)
+                if saw_effective_chunk {
+                    effective_chunk_seen = true;
+                    last_effective_activity = tokio::time::Instant::now();
+                }
+
                 if tx.send(Ok(data)).await.is_err() {
                     info!("[{}] [STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", rid, model, backend_name, content_text.len(), in_thinking);
                     break;
@@ -1147,14 +1182,8 @@ fn instrument_stream(
             .map(|t| t.duration_since(t_start).as_millis() as u64)
             .unwrap_or(ttfb_ms);
         let streaming_ms = total_ms.saturating_sub(ttft_ms);
-        // Prefer backend-reported tokens; fall back to tiktoken BPE count
         let output_tokens = backend_tokens.unwrap_or_else(|| count_tokens(&content_text));
-        // For batched responses (streaming_ms < 1s), use total_ms as denominator for effective throughput
-        let denom_ms = if streaming_ms < 1000 {
-            total_ms
-        } else {
-            streaming_ms
-        };
+        let denom_ms = if streaming_ms < 1000 { total_ms } else { streaming_ms };
         let tokens_per_sec = if output_tokens > 0 && denom_ms > 0 {
             output_tokens as f64 / (denom_ms as f64 / 1000.0)
         } else {
@@ -1172,12 +1201,7 @@ fn instrument_stream(
             output_tokens,
         );
 
-        let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
-        if slow {
-            info!("[{}] Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", rid, model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
-        } else {
-            info!("[{}] Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", rid, model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
-        }
+        info!("[{}] Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", rid, model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
     });
 
     let new_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
