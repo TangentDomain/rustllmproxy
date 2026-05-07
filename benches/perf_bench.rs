@@ -1,20 +1,25 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use llmproxy::config::Backend;
 use std::collections::HashMap;
 
 fn bench_extract_model_old(c: &mut Criterion) {
-    let json = br#"{"model":"glm-5.1","messages":[{"role":"user","content":"test"}],"stream":true}"#;
+    let json =
+        br#"{"model":"glm-5.1","messages":[{"role":"user","content":"test"}],"stream":true}"#;
 
     c.bench_function("extract_model_old_serde", |b| {
         b.iter(|| {
             let v: serde_json::Value = serde_json::from_slice(black_box(json)).unwrap();
-            v["model"].as_str().map(|s| s.to_string()).unwrap_or_default()
+            v["model"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_default()
         })
     });
 }
 
 fn bench_extract_model_new(c: &mut Criterion) {
-    let json = br#"{"model":"glm-5.1","messages":[{"role":"user","content":"test"}],"stream":true}"#;
+    let json =
+        br#"{"model":"glm-5.1","messages":[{"role":"user","content":"test"}],"stream":true}"#;
 
     c.bench_function("extract_model_new_byte_scan", |b| {
         b.iter(|| {
@@ -23,8 +28,9 @@ fn bench_extract_model_new(c: &mut Criterion) {
             if let Some(pos) = bytes.windows(PATTERN.len()).position(|w| w == PATTERN) {
                 let after_key = &bytes[pos + PATTERN.len()..];
                 if let Some(start) = after_key.iter().position(|&c| c == b'"') {
-                    if let Some(end) = after_key[start+1..].iter().position(|&c| c == b'"') {
-                        return String::from_utf8_lossy(&after_key[start+1..start+1+end]).into_owned();
+                    if let Some(end) = after_key[start + 1..].iter().position(|&c| c == b'"') {
+                        return String::from_utf8_lossy(&after_key[start + 1..start + 1 + end])
+                            .into_owned();
                     }
                 }
             }
@@ -45,12 +51,11 @@ fn bench_supports_model_old(c: &mut Criterion) {
         model_mappings: HashMap::new(),
         protocol: "openai".to_string(),
         auth_header: "Bearer key".to_string(),
+        strip_params: vec![],
     };
 
     c.bench_function("supports_model_old_to_string", |b| {
-        b.iter(|| {
-            backend.models.contains(&black_box("glm-5.1").to_string())
-        })
+        b.iter(|| backend.models.contains(&black_box("glm-5.1").to_string()))
     });
 }
 
@@ -66,12 +71,11 @@ fn bench_supports_model_new(c: &mut Criterion) {
         model_mappings: HashMap::new(),
         protocol: "openai".to_string(),
         auth_header: "Bearer key".to_string(),
+        strip_params: vec![],
     };
 
     c.bench_function("supports_model_new_iter_any", |b| {
-        b.iter(|| {
-            backend.models.iter().any(|m| m == black_box("glm-5.1"))
-        })
+        b.iter(|| backend.models.iter().any(|m| m == black_box("glm-5.1")))
     });
 }
 
@@ -176,26 +180,22 @@ fn bench_sse_line_parsing(c: &mut Criterion) {
 fn bench_extract_json_uint(c: &mut Criterion) {
     let mut group = c.benchmark_group("extract_json_uint");
 
-    let json1 = r#"{"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"}}],"output_tokens":42}"#;
-    let json2 = r#"{"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"}}],"usage":{"tokens":99}}"#;
+    let json1 =
+        r#"{"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"}}],"output_tokens":42}"#;
+    let json2 =
+        r#"{"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"}}],"usage":{"tokens":99}}"#;
     let json_no_tokens = r#"{"id":"chatcmpl-123","choices":[{"delta":{"content":"Hello"}}]}"#;
 
     group.bench_function("fast_with_output_tokens", |b| {
-        b.iter(|| {
-            black_box(extract_json_uint_fast_bench(black_box(json1)))
-        })
+        b.iter(|| black_box(extract_json_uint_fast_bench(black_box(json1))))
     });
 
     group.bench_function("fast_with_tokens", |b| {
-        b.iter(|| {
-            black_box(extract_json_uint_fast_bench(black_box(json2)))
-        })
+        b.iter(|| black_box(extract_json_uint_fast_bench(black_box(json2))))
     });
 
     group.bench_function("fast_no_tokens", |b| {
-        b.iter(|| {
-            black_box(extract_json_uint_fast_bench(black_box(json_no_tokens)))
-        })
+        b.iter(|| black_box(extract_json_uint_fast_bench(black_box(json_no_tokens))))
     });
 
     // Old format!-based version for comparison
@@ -224,29 +224,38 @@ fn bench_extract_model_scaling(c: &mut Criterion) {
     for size_kb in [1, 10, 100, 1000] {
         // Build a JSON body of approximately size_kb KB
         let filler = "x".repeat(size_kb * 1024 / 2);
-        let json = format!(r#"{{"model":"glm-5.1","messages":[{{"role":"user","content":"{}"}}],"stream":true}}"#, filler);
+        let json = format!(
+            r#"{{"model":"glm-5.1","messages":[{{"role":"user","content":"{}"}}],"stream":true}}"#,
+            filler
+        );
 
         group.throughput(Throughput::Bytes(json.len() as u64));
-        group.bench_with_input(BenchmarkId::new("byte_scan", format!("{}KB", size_kb)), &json, |b, json| {
-            b.iter(|| {
-                const PATTERN: &[u8] = b"\"model\"";
-                let bytes = json.as_bytes();
-                let mut result = String::new();
-                if let Some(pos) = bytes.windows(PATTERN.len()).position(|w| w == PATTERN) {
-                    let after_key = &bytes[pos + PATTERN.len()..];
-                    let after_colon = skip_ws(after_key);
-                    if !after_colon.is_empty() && after_colon[0] == b':' {
-                        let after_colon = skip_ws(&after_colon[1..]);
-                        if !after_colon.is_empty() && after_colon[0] == b'"' {
-                            if let Some(end) = after_colon[1..].iter().position(|&c| c == b'"') {
-                                result = String::from_utf8_lossy(&after_colon[1..1 + end]).into_owned();
+        group.bench_with_input(
+            BenchmarkId::new("byte_scan", format!("{}KB", size_kb)),
+            &json,
+            |b, json| {
+                b.iter(|| {
+                    const PATTERN: &[u8] = b"\"model\"";
+                    let bytes = json.as_bytes();
+                    let mut result = String::new();
+                    if let Some(pos) = bytes.windows(PATTERN.len()).position(|w| w == PATTERN) {
+                        let after_key = &bytes[pos + PATTERN.len()..];
+                        let after_colon = skip_ws(after_key);
+                        if !after_colon.is_empty() && after_colon[0] == b':' {
+                            let after_colon = skip_ws(&after_colon[1..]);
+                            if !after_colon.is_empty() && after_colon[0] == b'"' {
+                                if let Some(end) = after_colon[1..].iter().position(|&c| c == b'"')
+                                {
+                                    result = String::from_utf8_lossy(&after_colon[1..1 + end])
+                                        .into_owned();
+                                }
                             }
                         }
                     }
-                }
-                black_box(result)
-            })
-        });
+                    black_box(result)
+                })
+            },
+        );
     }
 
     group.finish();
@@ -266,11 +275,11 @@ fn bench_body_to_vec(c: &mut Criterion) {
         };
 
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::new("bytes_to_vec", &label), &data, |b, data| {
-            b.iter(|| {
-                black_box(data.to_vec())
-            })
-        });
+        group.bench_with_input(
+            BenchmarkId::new("bytes_to_vec", &label),
+            &data,
+            |b, data| b.iter(|| black_box(data.to_vec())),
+        );
     }
 
     group.finish();
@@ -305,7 +314,8 @@ fn extract_json_uint_fast_bench(json: &str) -> Option<u32> {
 }
 
 fn skip_ws(s: &[u8]) -> &[u8] {
-    s.iter().position(|&c| c != b' ' && c != b'\t' && c != b'\n' && c != b'\r')
+    s.iter()
+        .position(|&c| c != b' ' && c != b'\t' && c != b'\n' && c != b'\r')
         .map_or(&[], |i| &s[i..])
 }
 

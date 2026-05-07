@@ -1,13 +1,8 @@
-use axum::{
-    extract::Request,
-    http::StatusCode,
-    middleware::Next,
-    response::Response,
-};
 use crate::config::Config;
+use axum::{extract::Request, http::StatusCode, middleware::Next, response::Response};
 use dashmap::DashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// 每个key的限流状态
@@ -18,29 +13,37 @@ struct RateLimitEntry {
 
 impl Default for RateLimitEntry {
     fn default() -> Self {
-        Self { count: 0, window_start: Instant::now() }
+        Self {
+            count: 0,
+            window_start: Instant::now(),
+        }
     }
 }
 
 #[derive(Default)]
 pub struct RateLimiter {
     entries: DashMap<String, RateLimitEntry>,
-    check_count: AtomicU64,
+    /// 每次清理最多扫描的 entry 数，避免 retain() 带来的周期性尖峰。
+    cleanup_budget: usize,
+    /// 按需惰性清理计数器（通过预算分摊）
+    cleanup_cursor: AtomicU64,
 }
-
 impl RateLimiter {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: DashMap::new(),
+            cleanup_budget: 64,
+            cleanup_cursor: AtomicU64::new(0),
+        }
     }
 
     /// 返回 true 表示允许，false 表示被限流
     pub fn check(&self, key: &str, limit: u32) -> bool {
         let now = Instant::now();
 
-        // 惰性清理：每 256 次请求清理一次过期条目
-        if self.check_count.fetch_add(1, Ordering::Relaxed) % 256 == 0 {
-            self.entries.retain(|_, e| now.duration_since(e.window_start).as_secs() < 120);
-        }
+        // 惰性清理：将“全量 retain()”改为“按预算分摊扫描”。
+        // 语义保持：过期条目最终会被删除；只是从“周期性尖峰”变为“平滑的渐进成本”。
+        self.cleanup_some(now);
 
         // 先无分配查找已存在的 key
         if let Some(mut e) = self.entries.get_mut(key) {
@@ -53,8 +56,36 @@ impl RateLimiter {
             return entry.count <= limit;
         }
         // 不存在才分配并插入
-        self.entries.insert(key.to_string(), RateLimitEntry { count: 1, window_start: now });
+        self.entries.insert(
+            key.to_string(),
+            RateLimitEntry {
+                count: 1,
+                window_start: now,
+            },
+        );
         true
+    }
+
+    #[inline]
+    fn cleanup_some(&self, now: Instant) {
+        // 基于 window_start 过期逻辑：120s 内未被访问则可清理。
+        const STALE_SECS: u64 = 120;
+        let target = self.cleanup_budget.max(1);
+        let mut scanned = 0usize;
+        // DashMap::iter() 的遍历顺序不保证稳定；这里仅用于渐进式清理。
+        for entry in self.entries.iter() {
+            scanned += 1;
+            if scanned > target {
+                break;
+            }
+            // 仅在条目确实过期时尝试 remove，避免额外写锁竞争。
+            if now.duration_since(entry.value().window_start).as_secs() >= STALE_SECS {
+                let k = entry.key().clone();
+                self.entries.remove(&k);
+            }
+        }
+        self.cleanup_cursor
+            .fetch_add(scanned as u64, Ordering::Relaxed);
     }
 }
 

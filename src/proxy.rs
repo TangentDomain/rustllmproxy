@@ -4,22 +4,24 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{HeaderMap, Request, Response, StatusCode, header};
+use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::Router;
 use bytes::Bytes;
 use reqwest::Client;
 use tokio::signal;
+#[cfg(unix)]
+use tokio::signal::unix::{signal as unix_signal, SignalKind};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn, error, info_span};
+use tracing::{error, info, info_span, warn};
 
 use crate::balancer::WeightedRoundRobin;
-use crate::config::{Config, Backend};
-use std::collections::{HashMap, VecDeque};
-use rand::Rng;
+use crate::config::{Backend, Config};
 use parking_lot::RwLock;
+use rand::Rng;
+use std::collections::{HashMap, VecDeque};
 
 /// Per-backend tok/s rolling window for adaptive load balancing.
 /// Faster backends get more traffic automatically.
@@ -30,16 +32,23 @@ pub struct BackendMetrics {
 
 impl BackendMetrics {
     pub fn new(window: usize) -> Self {
-        Self { tok_per_sec: RwLock::new(HashMap::new()), window }
+        Self {
+            tok_per_sec: RwLock::new(HashMap::new()),
+            window,
+        }
     }
 
     /// Record a tok/s sample for a backend.
     pub fn record(&self, backend: &str, tps: f64) {
-        if tps <= 0.0 { return; }
+        if tps <= 0.0 {
+            return;
+        }
         let mut map = self.tok_per_sec.write();
         let v = map.entry(backend.to_string()).or_default();
         v.push_back(tps);
-        if v.len() > self.window { v.pop_front(); }
+        if v.len() > self.window {
+            v.pop_front();
+        }
     }
 
     /// Rolling average tok/s for a backend. Returns 1.0 if no data (equal default weight).
@@ -51,8 +60,8 @@ impl BackendMetrics {
             .unwrap_or(1.0)
     }
 }
-use crate::middleware::RateLimiter;
 use crate::metrics::MetricsStore;
+use crate::middleware::RateLimiter;
 
 /// 转发错误分类，决定后续行为
 enum ForwardError {
@@ -88,7 +97,10 @@ impl Proxy {
             .expect("failed to build reqwest client");
         let log_dir = config.server.log_dir.clone();
         Self {
-            config, balancer, limiter: Arc::new(RateLimiter::new()), client,
+            config,
+            balancer,
+            limiter: Arc::new(RateLimiter::new()),
+            client,
             metrics: Arc::new(BackendMetrics::new(10)),
             store: Arc::new(MetricsStore::new(&format!("{log_dir}/metrics"))),
         }
@@ -121,7 +133,8 @@ impl Proxy {
         let _enter = span.enter();
 
         let t_start = Instant::now();
-        let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
+        let fallback_deadline =
+            t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
         let (parts, body) = req.into_parts();
         let path = parts.uri.path();
 
@@ -137,7 +150,10 @@ impl Proxy {
 
         let model = extract_model_from_json(&bytes);
         if model.trim().is_empty() {
-            info!("Rejecting request with missing or empty model field: path={path}, protocol={:?}", protocol);
+            info!(
+                "Rejecting request with missing or empty model field: path={path}, protocol={:?}",
+                protocol
+            );
             return (StatusCode::BAD_REQUEST, "Missing or empty model field").into_response();
         }
         let body_size = bytes.len();
@@ -162,7 +178,9 @@ impl Proxy {
                 if data_count > 0 {
                     let avg_w = data_sum / data_count as f64;
                     for w in &mut weights {
-                        if *w == 1.0 { *w = avg_w; }
+                        if *w == 1.0 {
+                            *w = avg_w;
+                        }
                     }
                 }
                 let total_w: f64 = weights.iter().sum();
@@ -172,7 +190,13 @@ impl Proxy {
                 } else {
                     let r = rand::random::<f64>() * total_w;
                     let mut cum = 0.0;
-                    let idx = weights.iter().position(|w| { cum += *w; cum >= r }).unwrap_or(0);
+                    let idx = weights
+                        .iter()
+                        .position(|w| {
+                            cum += *w;
+                            cum >= r
+                        })
+                        .unwrap_or(0);
                     (idx, "weighted(tok/s)", Some(r))
                 };
                 let chosen = group[idx].clone();
@@ -210,19 +234,25 @@ impl Proxy {
                 continue;
             }
 
-            let healthy: Vec<_> = all_backends.iter()
-                .filter(|b| self.is_healthy(b))
-                .collect();
+            let healthy: Vec<_> = all_backends.iter().filter(|b| self.is_healthy(b)).collect();
 
             if healthy.is_empty() {
                 info!("No healthy backend for model={try_model}, skip to next model");
                 continue;
             }
 
-            info!("Trying model={}, healthy backends={}/{}", try_model, healthy.len(), all_backends.len());
+            info!(
+                "Trying model={}, healthy backends={}/{}",
+                try_model,
+                healthy.len(),
+                all_backends.len()
+            );
 
             if Instant::now() >= fallback_deadline {
-                warn!("Fallback deadline exceeded ({}s), aborting for model={}", self.config.server.fallback_timeout_secs, try_model);
+                warn!(
+                    "Fallback deadline exceeded ({}s), aborting for model={}",
+                    self.config.server.fallback_timeout_secs, try_model
+                );
                 break;
             }
 
@@ -245,54 +275,109 @@ impl Proxy {
                 1.0 // no data yet → equal default weight
             };
             for w in &mut weights {
-                if *w <= 1.0 { *w = avg_w; }
+                if *w <= 1.0 {
+                    *w = avg_w;
+                }
             }
             let total_w: f64 = weights.iter().sum();
             let r = rand::random::<f64>() * total_w;
             let mut cum = 0.0;
-            let start = weights.iter().position(|w| { cum += w; cum >= r }).unwrap_or(0);
+            let start = weights
+                .iter()
+                .position(|w| {
+                    cum += w;
+                    cum >= r
+                })
+                .unwrap_or(0);
             for i in 0..healthy.len() {
                 let selected = &healthy[(start + i) % healthy.len()];
                 let resolved = selected.resolve_model(try_model);
                 // Prepare body: model patch + backend-specific preprocessing
-                let body_bytes = prepare_request_body(&bytes, &original_model, try_model, &resolved, selected);
+                let body_bytes =
+                    prepare_request_body(&bytes, &original_model, try_model, &resolved, selected);
 
-                match self.do_forward(path, &parts.headers, body_bytes, selected).await {
+                match self
+                    .do_forward(path, &parts.headers, body_bytes, selected)
+                    .await
+                {
                     Ok((resp, ttfb, is_stream)) => {
                         let ttfb_ms = ttfb.as_millis() as u64;
-                        info!("Responding: {} -> {} via {} | ttfb={}ms, body={}B, stream={}",
-                            try_model, resolved, selected.name, ttfb_ms, body_size, is_stream);
+                        info!(
+                            "Responding: {} -> {} via {} | ttfb={}ms, body={}B, stream={}",
+                            try_model, resolved, selected.name, ttfb_ms, body_size, is_stream
+                        );
 
                         if is_stream {
-                            let idle_timeout = Duration::from_secs(self.config.server.stream_idle_timeout_secs);
-                            let first_chunk_timeout = Duration::from_secs(self.config.server.stream_first_chunk_timeout_secs);
-                            let (new_body, done_rx) = instrument_stream(resp.into_body(), model.clone(), resolved.clone(), selected.name.clone(), ttfb, t_start, idle_timeout, first_chunk_timeout, self.metrics.clone(), self.store.clone(), request_id.clone());
+                            let idle_timeout =
+                                Duration::from_secs(self.config.server.stream_idle_timeout_secs);
+                            let first_chunk_timeout = Duration::from_secs(
+                                self.config.server.stream_first_chunk_timeout_secs,
+                            );
+                            let (new_body, done_rx) = instrument_stream(
+                                resp.into_body(),
+                                model.clone(),
+                                resolved.clone(),
+                                selected.name.clone(),
+                                ttfb,
+                                t_start,
+                                idle_timeout,
+                                first_chunk_timeout,
+                                self.metrics.clone(),
+                                self.store.clone(),
+                                request_id.clone(),
+                            );
                             let mut resp = Response::new(new_body);
-                            resp.headers_mut().insert("x-accel-buffering", "no".parse().unwrap());
-                            resp.headers_mut().insert("cache-control", "no-cache".parse().unwrap());
-                            resp.headers_mut().insert("x-request-id", request_id.parse().unwrap());
-                            resp.headers_mut().insert("x-backend", selected.name.parse().unwrap());
-                            resp.headers_mut().insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
-                            let _done_task = done_rx;
+                            resp.headers_mut()
+                                .insert("x-accel-buffering", "no".parse().unwrap());
+                            resp.headers_mut()
+                                .insert("cache-control", "no-cache".parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-request-id", request_id.parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-backend", selected.name.parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
+                            let stream_task_request_id = request_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(err) = done_rx.await {
+                                    error!(
+                                        "[{}] stream instrumentation task failed: {}",
+                                        stream_task_request_id, err
+                                    );
+                                }
+                            });
                             return resp;
                         } else {
                             let total_ms = t_start.elapsed().as_millis() as u64;
-                            info!("Done: {} -> {} via {} | total={}ms, ttfb={}ms", model, resolved, selected.name, total_ms, ttfb_ms);
+                            info!(
+                                "Done: {} -> {} via {} | total={}ms, ttfb={}ms",
+                                model, resolved, selected.name, total_ms, ttfb_ms
+                            );
                             let mut resp = resp;
-                            resp.headers_mut().insert("x-request-id", request_id.parse().unwrap());
-                            resp.headers_mut().insert("x-backend", selected.name.parse().unwrap());
-                            resp.headers_mut().insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
-                            resp.headers_mut().insert("x-total-ms", total_ms.to_string().parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-request-id", request_id.parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-backend", selected.name.parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
+                            resp.headers_mut()
+                                .insert("x-total-ms", total_ms.to_string().parse().unwrap());
                             return resp;
                         }
                     }
                     Err(ForwardError::ClientError(status, body)) => {
                         let total_ms = t_start.elapsed().as_millis() as u64;
-                        info!("Client error from {}: {} - returning directly ({}ms)", selected.name, status, total_ms);
+                        info!(
+                            "Client error from {}: {} - returning directly ({}ms)",
+                            selected.name, status, total_ms
+                        );
                         return (status, body).into_response();
                     }
                     Err(ForwardError::RateLimited) => {
-                        info!("{} rate limited (429), switching to next backend", selected.name);
+                        info!(
+                            "{} rate limited (429), switching to next backend",
+                            selected.name
+                        );
                         continue;
                     }
                     Err(ForwardError::ServerErr(e)) => {
@@ -305,7 +390,10 @@ impl Proxy {
         }
 
         let total_ms = t_start.elapsed().as_millis() as u64;
-        error!("All models exhausted for original model={model} ({}ms)", total_ms);
+        error!(
+            "All models exhausted for original model={model} ({}ms)",
+            total_ms
+        );
         let mut resp = (
             StatusCode::SERVICE_UNAVAILABLE,
             axum::Json(serde_json::json!({
@@ -315,8 +403,10 @@ impl Proxy {
                 "elapsed_ms": total_ms,
                 "request_id": request_id,
             })),
-        ).into_response();
-        resp.headers_mut().insert("x-request-id", request_id.parse().unwrap());
+        )
+            .into_response();
+        resp.headers_mut()
+            .insert("x-request-id", request_id.parse().unwrap());
         resp
     }
 
@@ -335,12 +425,20 @@ impl Proxy {
         } else {
             path.to_string()
         };
-        let url = format!("{}/{}", backend.url.trim_end_matches('/'), forward_path.trim_start_matches('/'));
-        info!("Forwarding to {} (backend={}, protocol={})", url, backend.name, backend.protocol);
+        let url = format!(
+            "{}/{}",
+            backend.url.trim_end_matches('/'),
+            forward_path.trim_start_matches('/')
+        );
+        info!(
+            "Forwarding to {} (backend={}, protocol={})",
+            url, backend.name, backend.protocol
+        );
 
         let t_backend = Instant::now();
 
-        let mut req_builder = self.client
+        let mut req_builder = self
+            .client
             .post(&url)
             .timeout(Duration::from_secs(backend.timeout_secs))
             .body(body);
@@ -353,8 +451,7 @@ impl Proxy {
                     .header("anthropic-version", "2023-06-01");
             }
             _ => {
-                req_builder = req_builder
-                    .header(header::AUTHORIZATION, &backend.auth_header);
+                req_builder = req_builder.header(header::AUTHORIZATION, &backend.auth_header);
             }
         }
 
@@ -380,10 +477,11 @@ impl Proxy {
 
         if status.is_success() {
             let ttfb = t_backend.elapsed();
-            let is_stream = resp.headers()
+            let is_stream = resp
+                .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
-                .map_or(false, |v| v.contains("text/event-stream"));
+                .is_some_and(|v| v.contains("text/event-stream"));
             Ok((self.stream_response(resp).await, ttfb, is_stream))
         } else if code == 429 {
             Err(ForwardError::RateLimited)
@@ -393,23 +491,42 @@ impl Proxy {
             let body_str = String::from_utf8_lossy(&body_bytes);
             warn!("{} auth failed (401): {}", backend.name, body_str);
             let status_axum = StatusCode::from_u16(code).unwrap_or(StatusCode::UNAUTHORIZED);
-            Err(ForwardError::ClientError(status_axum, body_str.into_owned()))
-        } else if code >= 400 && code < 500 {
+            Err(ForwardError::ClientError(
+                status_axum,
+                body_str.into_owned(),
+            ))
+        } else if (400..500).contains(&code) {
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
             // 422 Unprocessable Entity: 通常是请求参数校验失败（max_tokens超限、格式错误等）
             // 换后端大概率一样失败，直接返回避免浪费时间
             if code == 422 {
-                info!("{} returned 422 (param error), returning directly: {}", backend.name, body_str);
-                let status_axum = StatusCode::from_u16(code).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
-                return Err(ForwardError::ClientError(status_axum, body_str.into_owned()));
+                info!(
+                    "{} returned 422 (param error), returning directly: {}",
+                    backend.name, body_str
+                );
+                let status_axum =
+                    StatusCode::from_u16(code).unwrap_or(StatusCode::UNPROCESSABLE_ENTITY);
+                return Err(ForwardError::ClientError(
+                    status_axum,
+                    body_str.into_owned(),
+                ));
             }
             // 400/403/404/415 等 → 不同 provider 可能行为不同，值得 fallback
-            info!("{} returned {} (4xx), falling back: {}", backend.name, status, body_str);
-            Err(ForwardError::ServerErr(format!("{} returned {}: {}", backend.name, status, body_str)))
+            info!(
+                "{} returned {} (4xx), falling back: {}",
+                backend.name, status, body_str
+            );
+            Err(ForwardError::ServerErr(format!(
+                "{} returned {}: {}",
+                backend.name, status, body_str
+            )))
         } else {
             // 5xx 服务端错误 → 切换下一个后端
-            Err(ForwardError::ServerErr(format!("{} returned {}", backend.name, status)))
+            Err(ForwardError::ServerErr(format!(
+                "{} returned {}",
+                backend.name, status
+            )))
         }
     }
 
@@ -451,18 +568,22 @@ pub async fn auth_layer(
             let uri = request.uri();
             let path = uri.path();
             let query = uri.query().unwrap_or("");
-            let user_agent = request.headers()
+            let user_agent = request
+                .headers()
                 .get("user-agent")
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("unknown");
-            let real_ip = request.headers()
+            let real_ip = request
+                .headers()
                 .get("x-real-ip")
                 .or_else(|| request.headers().get("x-forwarded-for"))
                 .and_then(|h| h.to_str().ok())
                 .unwrap_or("unknown");
 
-            info!("Request missing auth: method={}, path={}, query={}, user_agent={}, real_ip={}",
-                method, path, query, user_agent, real_ip);
+            info!(
+                "Request missing auth: method={}, path={}, query={}, user_agent={}, real_ip={}",
+                method, path, query, user_agent, real_ip
+            );
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
@@ -474,7 +595,10 @@ pub async fn auth_layer(
             let method = request.method();
             let path = request.uri().path();
             let key_preview = if key.len() > 8 { &key[..8] } else { &key };
-            warn!("Invalid API key: method={}, path={}, key_prefix={}", method, path, key_preview);
+            warn!(
+                "Invalid API key: method={}, path={}, key_prefix={}",
+                method, path, key_preview
+            );
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
@@ -484,9 +608,11 @@ pub async fn auth_layer(
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    request.extensions_mut().insert(crate::middleware::AuthInfo {
-        key_name: api_key.name.clone(),
-    });
+    request
+        .extensions_mut()
+        .insert(crate::middleware::AuthInfo {
+            key_name: api_key.name.clone(),
+        });
     Ok(next.run(request).await)
 }
 
@@ -515,8 +641,6 @@ fn extract_model_from_json(bytes: &[u8]) -> String {
     String::new()
 }
 
-
-
 /// 从 JSON bytes 中快速提取 max_tokens / max_completion_tokens（手动扫描，避免完整反序列化）
 fn extract_max_tokens(bytes: &[u8]) -> Option<u32> {
     // 扫描前 8KB（max_tokens 通常在 model 附近）
@@ -529,10 +653,16 @@ fn extract_max_tokens(bytes: &[u8]) -> Option<u32> {
             let after_colon = skip_whitespace(after_key);
             if !after_colon.is_empty() && after_colon[0] == b':' {
                 let after_colon = skip_whitespace(&after_colon[1..]);
-                if !after_colon.is_empty() && (after_colon[0].is_ascii_digit() || after_colon[0] == b'-') {
+                if !after_colon.is_empty()
+                    && (after_colon[0].is_ascii_digit() || after_colon[0] == b'-')
+                {
                     let mut val: u32 = 0;
                     for &b in after_colon.iter().take(10) {
-                        if b.is_ascii_digit() { val = val * 10 + (b - b'0') as u32; } else { break; }
+                        if b.is_ascii_digit() {
+                            val = val * 10 + (b - b'0') as u32;
+                        } else {
+                            break;
+                        }
                     }
                     return Some(val);
                 }
@@ -543,7 +673,8 @@ fn extract_max_tokens(bytes: &[u8]) -> Option<u32> {
 }
 #[inline]
 fn skip_whitespace(s: &[u8]) -> &[u8] {
-    s.iter().position(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+    s.iter()
+        .position(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
         .map_or(&[], |i| &s[i..])
 }
 
@@ -553,7 +684,7 @@ fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
     if old_model == new_model {
         return bytes.to_vec();
     }
-    let pattern = format!("\"model\"");
+    let pattern = "\"model\"".to_string();
     let p = pattern.as_bytes();
     let Some(mut pos) = bytes.windows(p.len()).position(|w| w == p) else {
         return bytes.to_vec();
@@ -595,7 +726,8 @@ fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
         return bytes.to_vec();
     }
 
-    let mut result = Vec::with_capacity(bytes.len() + new_model.len().saturating_sub(old_model.len()));
+    let mut result =
+        Vec::with_capacity(bytes.len() + new_model.len().saturating_sub(old_model.len()));
     result.extend_from_slice(&bytes[..value_start]);
     result.extend_from_slice(new_model.as_bytes());
     result.extend_from_slice(&bytes[value_end..]);
@@ -615,7 +747,8 @@ fn prepare_request_body(
     let needs_strip = !backend.strip_params.is_empty();
     let needs_sanitize = backend.name == "zhipu-anthropic";
     // MiniMax Anthropic needs max_completion_tokens → max_tokens rename
-    let needs_max_tokens_rename = backend.protocol == "anthropic" && backend.name.starts_with("minimax-anthropic");
+    let needs_max_tokens_rename =
+        backend.protocol == "anthropic" && backend.name.starts_with("minimax-anthropic");
 
     if !needs_model_patch && !needs_strip && !needs_sanitize && !needs_max_tokens_rename {
         return bytes.clone();
@@ -682,11 +815,16 @@ fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
             }
         } else {
             match b {
-                b'"' => { in_string = true; cleaned.push(b); }
+                b'"' => {
+                    in_string = true;
+                    cleaned.push(b);
+                }
                 b',' => {
                     // Look ahead: skip comma if followed by } or ]
                     let mut j = i + 1;
-                    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') { j += 1; }
+                    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
+                        j += 1;
+                    }
                     if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
                         // Trailing comma: skip it
                     } else {
@@ -705,7 +843,6 @@ fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
         cleaned
     }
 }
-
 
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
     if let Some(auth) = req.headers().get("authorization") {
@@ -741,17 +878,22 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
     balancer.start_health_check(Duration::from_secs(30));
 
     // 公共路由（不需要认证）
-    let public_routes = Router::new()
-        .route("/health", get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }));
+    let public_routes = Router::new().route(
+        "/health",
+        get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+    );
 
     // 受保护路由（需要认证）
     let protected_routes = Router::new()
         .route("/backends", get(backends_handler))
         .merge(extra_routes)
-        .fallback(post(|state: State<Arc<Proxy>>, req: Request<Body>| async move {
-            state.0.handle(req).await
-        }))
-        .layer(axum::middleware::from_fn_with_state(proxy.clone(), auth_layer));
+        .fallback(post(
+            |state: State<Arc<Proxy>>, req: Request<Body>| async move { state.0.handle(req).await },
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            proxy.clone(),
+            auth_layer,
+        ));
 
     let store = proxy.store.clone();
     let app = public_routes
@@ -772,14 +914,19 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
                 store.flush();
                 // 清理 24h 无新数据的 entry，防止 DashMap 键空间无限增长
                 store.evict_stale(24 * 3600);
-            }).await;
+            })
+            .await;
         }
     });
 
     use tokio::net::TcpSocket;
     let tcp_socket = TcpSocket::new_v4().expect("failed to create TCP socket");
-    tcp_socket.set_reuseaddr(true).expect("failed to set reuseaddr");
-    tcp_socket.set_keepalive(true).expect("failed to set keepalive");
+    tcp_socket
+        .set_reuseaddr(true)
+        .expect("failed to set reuseaddr");
+    tcp_socket
+        .set_keepalive(true)
+        .expect("failed to set keepalive");
     tcp_socket.bind(addr).expect("failed to bind");
     let listener = tcp_socket.listen(1024).expect("failed to listen");
     axum::serve(listener, app)
@@ -789,24 +936,51 @@ pub async fn run_server(config: Config, extra_routes: Router<Arc<Proxy>>) {
 }
 
 async fn backends_handler(State(proxy): State<Arc<Proxy>>) -> axum::Json<serde_json::Value> {
-    let backends: Vec<serde_json::Value> = proxy.balancer().all_backends().iter().map(|b| {
-        serde_json::json!({
-            "name": b.backend.name,
-            "url": b.backend.url,
-            "healthy": b.healthy.load(std::sync::atomic::Ordering::Relaxed),
-            "fail_count": b.fail_count.load(std::sync::atomic::Ordering::Relaxed),
+    let backends: Vec<serde_json::Value> = proxy
+        .balancer()
+        .all_backends()
+        .iter()
+        .map(|b| {
+            serde_json::json!({
+                "name": b.backend.name,
+                "url": b.backend.url,
+                "healthy": b.healthy.load(std::sync::atomic::Ordering::Relaxed),
+                "fail_count": b.fail_count.load(std::sync::atomic::Ordering::Relaxed),
+            })
         })
-    }).collect();
+        .collect();
     axum::Json(serde_json::json!({"backends": backends}))
 }
 
 async fn shutdown_signal() {
-    signal::ctrl_c().await.expect("failed to listen for ctrl+c");
-    info!("Shutting down...");
+    let ctrl_c = async {
+        signal::ctrl_c().await.expect("failed to listen for ctrl+c");
+        "ctrl_c"
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        let mut sigterm =
+            unix_signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+        sigterm.recv().await;
+        "sigterm"
+    };
+
+    #[cfg(unix)]
+    let signal_name = tokio::select! {
+        name = ctrl_c => name,
+        name = terminate => name,
+    };
+
+    #[cfg(not(unix))]
+    let signal_name = ctrl_c.await;
+
+    info!("Shutting down on {}...", signal_name);
 }
 
 /// 包裹 stream body，追踪 token 数量，完成后打印完整性能指标。
 /// 优化：使用 copy_in_place 压缩 + Bytes 零拷贝转发 + 预分配缓冲区。
+#[allow(clippy::too_many_arguments)]
 fn instrument_stream(
     body: Body,
     model: String,
@@ -847,20 +1021,34 @@ fn instrument_stream(
                 Ok(Some(result)) => result,
                 Ok(None) => break, // stream 正常结束
                 Err(_) => {
-                    warn!("[{}] Stream idle timeout ({}s) on {} via {}, sending error to client", rid, stream_idle_timeout.as_secs(), model, backend_name);
-                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("Stream idle timeout after {}s", stream_idle_timeout.as_secs())))).await;
+                    warn!(
+                        "[{}] Stream idle timeout ({}s) on {} via {}, sending error to client",
+                        rid,
+                        stream_idle_timeout.as_secs(),
+                        model,
+                        backend_name
+                    );
+                    let _ = tx
+                        .send(Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "Stream idle timeout after {}s",
+                                stream_idle_timeout.as_secs()
+                            ),
+                        )))
+                        .await;
                     break;
                 }
             };
             let frame = match frame_result {
                 Ok(f) => f,
                 Err(e) => {
-                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e))).await;
+                    let _ = tx.send(Err(std::io::Error::other(e))).await;
                     break;
                 }
             };
 
-            if let Some(data) = frame.into_data().ok() {
+            if let Ok(data) = frame.into_data() {
                 buffer.extend_from_slice(&data);
 
                 // Scan for complete SSE lines using memchr for SIMD-accelerated newline search
@@ -878,16 +1066,25 @@ fn instrument_stream(
                                         // 检测 thinking 阶段
                                         if !in_thinking && text.contains(r#""type":"thinking"#) {
                                             in_thinking = true;
-                                            info!("[{}] [THINKING] Started on {} via {}", rid, model, backend_name);
+                                            info!(
+                                                "[{}] [THINKING] Started on {} via {}",
+                                                rid, model, backend_name
+                                            );
                                         }
-                                        if in_thinking && (text.contains(r#""type":"content_block_stop"#) || text.contains(r#""content_block_stop"#)) {
-                                            if !text.contains(r#""type":"thinking"#) {
-                                                in_thinking = false;
-                                                info!("[{}] [THINKING] Ended on {} via {} (elapsed: {}ms)", rid, model, backend_name, t_start.elapsed().as_millis());
-                                            }
+                                        if in_thinking
+                                            && (text.contains(r#""type":"content_block_stop"#)
+                                                || text.contains(r#""content_block_stop"#))
+                                            && !text.contains(r#""type":"thinking"#)
+                                        {
+                                            in_thinking = false;
+                                            info!("[{}] [THINKING] Ended on {} via {} (elapsed: {}ms)", rid, model, backend_name, t_start.elapsed().as_millis());
                                         }
                                         // Detect ttft
-                                        if first_text_token.is_none() && (text.contains("\"text_delta\"") || text.contains("\"content\":\"") || text.contains("\"reasoning_content\":\"")) {
+                                        if first_text_token.is_none()
+                                            && (text.contains("\"text_delta\"")
+                                                || text.contains("\"content\":\"")
+                                                || text.contains("\"reasoning_content\":\""))
+                                        {
                                             first_text_token = Some(Instant::now());
                                         }
                                         // Accumulate content text for token counting
@@ -899,10 +1096,15 @@ fn instrument_stream(
                                         let check_elapsed = last_speed_check.elapsed();
                                         if check_elapsed >= Duration::from_secs(10) {
                                             let current_token_count = content_text.len();
-                                            let recent_chars = current_token_count.saturating_sub(tokens_at_last_check);
-                                            let recent_tps = recent_chars as f64 / check_elapsed.as_secs_f64();
+                                            let recent_chars = current_token_count
+                                                .saturating_sub(tokens_at_last_check);
+                                            let recent_tps =
+                                                recent_chars as f64 / check_elapsed.as_secs_f64();
                                             // 大约 4 chars per token, threshold ~1 tok/s = 4 chars/s
-                                            if recent_tps < 4.0 && recent_tps > 0.0 && !slow_warning_sent {
+                                            if recent_tps < 4.0
+                                                && recent_tps > 0.0
+                                                && !slow_warning_sent
+                                            {
                                                 warn!(
                                                     "[{}] [SLOW STREAM] {} via {}: ~{:.1} tok/s in last {:.0}s (total elapsed: {:.1}s)",
                                                     rid,
@@ -948,13 +1150,27 @@ fn instrument_stream(
         // Prefer backend-reported tokens; fall back to tiktoken BPE count
         let output_tokens = backend_tokens.unwrap_or_else(|| count_tokens(&content_text));
         // For batched responses (streaming_ms < 1s), use total_ms as denominator for effective throughput
-        let denom_ms = if streaming_ms < 1000 { total_ms } else { streaming_ms };
+        let denom_ms = if streaming_ms < 1000 {
+            total_ms
+        } else {
+            streaming_ms
+        };
         let tokens_per_sec = if output_tokens > 0 && denom_ms > 0 {
             output_tokens as f64 / (denom_ms as f64 / 1000.0)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
 
         metrics.record(&backend_name, tokens_per_sec);
-        store.record(&backend_name, &resolved, tokens_per_sec, ttfb_ms, ttft_ms, total_ms, output_tokens);
+        store.record(
+            &backend_name,
+            &resolved,
+            tokens_per_sec,
+            ttfb_ms,
+            ttft_ms,
+            total_ms,
+            output_tokens,
+        );
 
         let slow = output_tokens > 0 && tokens_per_sec > 0.0 && tokens_per_sec < 5.0;
         if slow {
@@ -971,17 +1187,79 @@ fn instrument_stream(
 /// Extract text from content, reasoning_content, and thinking fields.
 /// Accumulates raw UTF-8 bytes (no serde_json, non-blocking).
 fn append_content_text(json: &str, content_text: &mut String) {
+    // 说明：这里是 stream 热路径，避免重复的 O(n*k) windows 扫描。
+    // 我们采用单次线性扫描，识别三个字段：content / reasoning_content / thinking。
+    // 保持原有语义：遇到字段后仍通过 append_json_string_value 进行 JSON escape 解码。
     let bytes = json.as_bytes();
-    if let Some(pos) = bytes.windows(b"\"reasoning_content\":\"".len()).position(|w| w == *b"\"reasoning_content\":\"") {
-        append_json_string_value(bytes, pos + b"\"reasoning_content\":\"".len(), content_text);
-    }
-    if let Some(pos) = bytes.windows(b"\"content\":\"".len()).position(|w| w == *b"\"content\":\"") {
-        if pos == 0 || bytes[pos - 1] != b'_' {
-            append_json_string_value(bytes, pos + b"\"content\":\"".len(), content_text);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
         }
-    }
-    if let Some(pos) = bytes.windows(b"\"thinking\":\"".len()).position(|w| w == *b"\"thinking\":\"") {
-        append_json_string_value(bytes, pos + b"\"thinking\":\"".len(), content_text);
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        // 读取 key（不做通用 JSON 解析，只覆盖我们关心的几个 key，且正确跳过转义）
+        let key_start = i;
+        let mut escaped = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                break;
+            }
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let key_end = i;
+        i += 1; // skip closing quote
+                // 跳过空白，确认 ':'
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'"' {
+            continue;
+        }
+        // 现在 i 指向 value 的 opening quote
+        let value_start = i + 1;
+        let key = &bytes[key_start..key_end];
+        if key == b"reasoning_content" || key == b"thinking" || key == b"content" {
+            // 原逻辑：content 需排除 _content（如 reasoning_content）
+            if key == b"content" && key_start >= 2 && bytes[key_start - 2] == b'_' {
+                // ..."_content":"..."... 这种情况跳过
+            } else {
+                append_json_string_value(bytes, value_start, content_text);
+            }
+        }
+        // 跳过 value 字符串内容（正确处理转义），避免对长文本重复扫描
+        i = value_start;
+        escaped = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                i += 1;
+                break;
+            }
+            i += 1;
+        }
     }
 }
 
@@ -1009,16 +1287,66 @@ fn append_json_string_value(bytes: &[u8], start: usize, out: &mut String) {
 
 /// Extract completion_tokens from backend's final usage chunk.
 fn extract_completion_tokens(json: &str) -> Option<u32> {
+    // 热路径：避免 windows().position() 额外迭代开销。
+    // 这里不做完整 JSON 解析，只寻找 "completion_tokens": 后的连续数字。
     let bytes = json.as_bytes();
-    let pat = b"\"completion_tokens\":";
-    let pos = bytes.windows(pat.len()).position(|w| w == pat)?;
-    let after = &bytes[pos + pat.len()..];
-    let start = after.iter().position(|&b| b.is_ascii_digit())?;
-    let mut val: u32 = 0;
-    for &b in &after[start..] {
-        if b.is_ascii_digit() { val = val * 10 + (b - b'0') as u32; } else { break; }
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] != b'"' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let key_start = i;
+        let mut escaped = false;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                break;
+            }
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let key_end = i;
+        i += 1; // closing quote
+        if &bytes[key_start..key_end] != b"completion_tokens" {
+            continue;
+        }
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b':' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if !bytes[i].is_ascii_digit() {
+            return None;
+        }
+        let mut val: u32 = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if b.is_ascii_digit() {
+                val = val.saturating_mul(10).saturating_add((b - b'0') as u32);
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        return Some(val);
     }
-    Some(val)
+    None
 }
 
 /// Count tokens using tiktoken cl100k_base BPE encoding.
@@ -1050,5 +1378,10 @@ mod tests {
         );
         assert_eq!(out, "think\tanswerdone");
     }
-}
 
+    #[test]
+    fn extract_completion_tokens_parses_number() {
+        let json = r#"{"usage":{"completion_tokens":123,"prompt_tokens":9}}"#;
+        assert_eq!(extract_completion_tokens(json), Some(123));
+    }
+}

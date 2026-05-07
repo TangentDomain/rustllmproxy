@@ -6,7 +6,7 @@ use std::path::PathBuf;
 /// Single request metric sample
 #[derive(Serialize, Deserialize, Clone)]
 struct Sample {
-    time: String,       // ISO8601
+    time: String, // ISO8601
     tok_per_sec: f64,
     ttfb_ms: u64,
     ttft_ms: u64,
@@ -28,7 +28,7 @@ struct ModelFile {
     avg_total_ms: f64,
     avg_tokens: f64,
     last_updated: String,
-    recent: Vec<Sample>,  // last 100 requests
+    recent: Vec<Sample>, // last 100 requests
 }
 
 impl ModelFile {
@@ -74,10 +74,15 @@ impl MetricsStore {
     pub fn new(base_dir: &str) -> Self {
         let dir = PathBuf::from(base_dir);
         fs::create_dir_all(&dir).ok();
-        Self { dir, data: DashMap::new(), model_totals: DashMap::new() }
+        Self {
+            dir,
+            data: DashMap::new(),
+            model_totals: DashMap::new(),
+        }
     }
 
     /// Record a completed request
+    #[allow(clippy::too_many_arguments)]
     pub fn record(
         &self,
         backend: &str,
@@ -88,7 +93,9 @@ impl MetricsStore {
         total_ms: u64,
         tokens: u32,
     ) {
-        if tok_per_sec <= 0.0 { return; }
+        if tok_per_sec <= 0.0 {
+            return;
+        }
         let sample = Sample {
             time: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             tok_per_sec,
@@ -119,7 +126,11 @@ impl MetricsStore {
             .get(model)
             .and_then(|total| {
                 let (sum, count) = *total;
-                if count == 0 { None } else { Some(sum / count as f64) }
+                if count == 0 {
+                    None
+                } else {
+                    Some(sum / count as f64)
+                }
             })
             .unwrap_or(1.0)
     }
@@ -128,7 +139,9 @@ impl MetricsStore {
     pub fn flush(&self) {
         for entry in self.data.iter() {
             let ((backend, model), samples) = entry.pair();
-            if samples.is_empty() { continue; }
+            if samples.is_empty() {
+                continue;
+            }
             let model_file = ModelFile::compute(samples);
             let backend_dir = self.dir.join(sanitize_filename(backend));
             fs::create_dir_all(&backend_dir).ok();
@@ -142,14 +155,11 @@ impl MetricsStore {
     /// 清理长时间无新数据的 entry，防止 DashMap 键空间无限增长。
     /// 保留最近 max_age_secs 秒内有数据的 entry，删除其余的。
     pub fn evict_stale(&self, max_age_secs: u64) {
-        let cutoff = chrono::Local::now()
-            - chrono::Duration::seconds(max_age_secs as i64);
+        let cutoff = chrono::Local::now() - chrono::Duration::seconds(max_age_secs as i64);
         let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
         self.data.retain(|key, samples| {
             // 保留最后一个 sample 时间在 cutoff 之后的 entry
-            let keep = samples.last()
-                .map(|s| s.time > cutoff_str)
-                .unwrap_or(false);
+            let keep = samples.last().map(|s| s.time > cutoff_str).unwrap_or(false);
             if keep {
                 return true;
             }
@@ -171,7 +181,10 @@ impl MetricsStore {
         if added_count == 0 && removed_count == 0 {
             return;
         }
-        let mut total = self.model_totals.entry(model.to_string()).or_insert((0.0, 0));
+        let mut total = self
+            .model_totals
+            .entry(model.to_string())
+            .or_insert((0.0, 0));
         total.0 += added_sum;
         total.1 += added_count;
         total.0 -= removed_sum;
@@ -180,11 +193,18 @@ impl MetricsStore {
             drop(total);
             self.model_totals.remove(model);
         }
-}
-
+    }
 }
 fn sanitize_filename(s: &str) -> String {
-    s.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -193,7 +213,9 @@ mod tests {
 
     #[test]
     fn avg_for_model_uses_incremental_totals_across_backends() {
-        let store = MetricsStore::new("target/test-metrics/avg_for_model_uses_incremental_totals_across_backends");
+        let store = MetricsStore::new(
+            "target/test-metrics/avg_for_model_uses_incremental_totals_across_backends",
+        );
 
         assert_eq!(store.avg_for_model("glm-5.1"), 1.0);
 
@@ -208,7 +230,9 @@ mod tests {
 
     #[test]
     fn record_keeps_model_totals_in_sync_with_window_eviction() {
-        let store = MetricsStore::new("target/test-metrics/record_keeps_model_totals_in_sync_with_window_eviction");
+        let store = MetricsStore::new(
+            "target/test-metrics/record_keeps_model_totals_in_sync_with_window_eviction",
+        );
 
         for _ in 0..1000 {
             store.record("backend-a", "glm-5.1", 10.0, 1, 1, 1, 1);

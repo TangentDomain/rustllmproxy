@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::routing::{get, post};
-use axum::{Router, Json};
+use axum::{Json, Router};
 use serde_json::Value;
 use tracing::info;
 
+use axum::body::Body;
+use axum::http::{Request, Response};
 use llmproxy::config::Config;
 use llmproxy::proxy::{self, Proxy};
-use axum::http::{Request, Response};
-use axum::body::Body;
 
 #[tokio::main]
 async fn main() {
@@ -22,11 +22,12 @@ async fn main() {
 
     let log_dir = config.server.log_dir.clone();
     std::fs::create_dir_all(&log_dir).ok();
-    let file_appender = tracing_appender::rolling::daily(&log_dir, format!("proxy-{}", config.server.port));
+    let file_appender =
+        tracing_appender::rolling::daily(&log_dir, format!("proxy-{}", config.server.port));
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     std::mem::forget(guard);
 
-    use tracing_subscriber::{Layer, prelude::*};
+    use tracing_subscriber::{prelude::*, Layer};
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::INFO)
@@ -47,7 +48,10 @@ async fn main() {
         )
         .init();
 
-    info!("Starting unified-proxy on :{}, logging to {}/", config.server.port, log_dir);
+    info!(
+        "Starting unified-proxy on :{}, logging to {}/",
+        config.server.port, log_dir
+    );
     info!("Loaded config: {}", config_path);
 
     let routes = Router::new()
@@ -60,13 +64,18 @@ async fn main() {
 }
 
 async fn openai_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<Value> {
-    let models: Vec<Value> = proxy.config().all_models().iter().map(|m| {
-        serde_json::json!({
-            "id": m,
-            "object": "model",
-            "owned_by": "llmproxy",
+    let models: Vec<Value> = proxy
+        .config()
+        .all_models()
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m,
+                "object": "model",
+                "owned_by": "llmproxy",
+            })
         })
-    }).collect();
+        .collect();
     Json(serde_json::json!({
         "object": "list",
         "data": models,
@@ -74,22 +83,24 @@ async fn openai_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<Value> {
 }
 
 async fn anthropic_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<Value> {
-    let models: Vec<Value> = proxy.config().all_models().iter().map(|m| {
-        serde_json::json!({
-            "id": m,
-            "name": m,
-            "display_name": m,
+    let models: Vec<Value> = proxy
+        .config()
+        .all_models()
+        .iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m,
+                "name": m,
+                "display_name": m,
+            })
         })
-    }).collect();
+        .collect();
     Json(serde_json::json!({
         "models": models,
     }))
 }
 
-async fn openai_handler(
-    State(proxy): State<Arc<Proxy>>,
-    mut req: Request<Body>,
-) -> Response<Body> {
+async fn openai_handler(State(proxy): State<Arc<Proxy>>, mut req: Request<Body>) -> Response<Body> {
     // 重写路径：移除 /openai 前缀
     let uri = req.uri().to_string();
     let new_path = uri.replacen("/openai", "", 1);

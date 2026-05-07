@@ -89,7 +89,10 @@ async fn chat_handler(
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     if stream {
         let delay_ms = config.delay_ms;
@@ -124,10 +127,7 @@ async fn chat_handler(
     }
 }
 
-fn mock_sse_stream(
-    model: String,
-    delay_ms: u64,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+fn mock_sse_stream(model: String, delay_ms: u64) -> impl Stream<Item = Result<Event, Infallible>> {
     let req_id = format!("chatcmpl-{}", uuid_part());
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -135,8 +135,15 @@ fn mock_sse_stream(
         .as_secs();
 
     let chunks = vec![
-        "This", " is", " a", " mock", " response",
-        " for", " streaming", " testing", ".",
+        "This",
+        " is",
+        " a",
+        " mock",
+        " response",
+        " for",
+        " streaming",
+        " testing",
+        ".",
     ];
 
     let events: Vec<Event> = chunks
