@@ -14,6 +14,42 @@ struct Sample {
     tokens: u32,
 }
 
+
+/// record/evict 过程中对 model_totals 的增量更新。
+///
+/// 设计目标：
+/// - 增量语义明确：added 与 removed 分开表达，避免调用点散落重复算术。
+/// - coupling point 薄：仅暴露 tok/s 与 count，不携带 samples/持久化细节。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct ModelTotalDelta {
+    added_sum: f64,
+    added_count: usize,
+    removed_sum: f64,
+    removed_count: usize,
+}
+
+impl ModelTotalDelta {
+    fn from_added(tok_per_sec: f64) -> Self {
+        Self {
+            added_sum: tok_per_sec,
+            added_count: 1,
+            ..Self::default()
+        }
+    }
+
+    fn from_removed(removed_sum: f64, removed_count: usize) -> Self {
+        Self {
+            removed_sum,
+            removed_count,
+            ..Self::default()
+        }
+    }
+
+    fn is_noop(self) -> bool {
+        self.added_count == 0 && self.removed_count == 0
+    }
+}
+
 /// Persistent per-model metrics file
 #[derive(Serialize, Deserialize, Default)]
 struct ModelFile {
@@ -107,16 +143,23 @@ impl MetricsStore {
         let key = (backend.to_string(), model.to_string());
         let mut samples = self.data.entry(key).or_default();
         samples.push(sample);
+        let removed = Self::prune_to_window(&mut samples, 1000);
+        self.apply_model_total_delta(model, ModelTotalDelta::from_added(tok_per_sec), removed);
+    }
+
+    /// 将 samples 裁剪为最多 MAX_SAMPLES 条，并返回被移除部分对 tok/s 总和与样本数的影响。
+    fn prune_to_window(samples: &mut Vec<Sample>, max_samples: usize) -> ModelTotalDelta {
+        if samples.len() <= max_samples {
+            return ModelTotalDelta::default();
+        }
+        let drain_from = samples.len() - max_samples;
         let mut removed_sum = 0.0;
         let mut removed_count = 0usize;
-        if samples.len() > 1000 {
-            let drain_from = samples.len() - 1000;
-            for removed in samples.drain(0..drain_from) {
-                removed_sum += removed.tok_per_sec;
-                removed_count += 1;
-            }
+        for removed in samples.drain(0..drain_from) {
+            removed_sum += removed.tok_per_sec;
+            removed_count += 1;
         }
-        self.update_model_total(model, tok_per_sec, 1, removed_sum, removed_count);
+        ModelTotalDelta::from_removed(removed_sum, removed_count)
     }
 
     /// Average tok/s for a model aggregated across all backends.
@@ -136,19 +179,25 @@ impl MetricsStore {
     }
 
     /// Flush all metrics to disk (call periodically)
+    ///
+    /// 注意：磁盘持久化属于 store 的内部职责边界；调用方不应依赖其细节。
     pub fn flush(&self) {
         for entry in self.data.iter() {
             let ((backend, model), samples) = entry.pair();
-            if samples.is_empty() {
-                continue;
-            }
-            let model_file = ModelFile::compute(samples);
-            let backend_dir = self.dir.join(sanitize_filename(backend));
-            fs::create_dir_all(&backend_dir).ok();
-            let file_path = backend_dir.join(format!("{}.json", sanitize_filename(model)));
-            if let Ok(json) = serde_json::to_string_pretty(&model_file) {
-                fs::write(&file_path, json).ok();
-            }
+            self.flush_entry(backend, model, samples);
+        }
+    }
+
+    fn flush_entry(&self, backend: &str, model: &str, samples: &[Sample]) {
+        if samples.is_empty() {
+            return;
+        }
+        let model_file = ModelFile::compute(samples);
+        let backend_dir = self.dir.join(sanitize_filename(backend));
+        fs::create_dir_all(&backend_dir).ok();
+        let file_path = backend_dir.join(format!("{}.json", sanitize_filename(model)));
+        if let Ok(json) = serde_json::to_string_pretty(&model_file) {
+            fs::write(&file_path, json).ok();
         }
     }
 
@@ -165,30 +214,29 @@ impl MetricsStore {
             }
             let removed_sum = samples.iter().map(|s| s.tok_per_sec).sum::<f64>();
             let removed_count = samples.len();
-            self.update_model_total(&key.1, 0.0, 0, removed_sum, removed_count);
+            self.apply_model_total_delta(&key.1, ModelTotalDelta::default(), ModelTotalDelta::from_removed(removed_sum, removed_count));
             false
         });
     }
 
-    fn update_model_total(
-        &self,
-        model: &str,
-        added_sum: f64,
-        added_count: usize,
-        removed_sum: f64,
-        removed_count: usize,
-    ) {
-        if added_count == 0 && removed_count == 0 {
+    fn apply_model_total_delta(&self, model: &str, added: ModelTotalDelta, removed: ModelTotalDelta) {
+        let delta = ModelTotalDelta {
+            added_sum: added.added_sum,
+            added_count: added.added_count,
+            removed_sum: removed.removed_sum,
+            removed_count: removed.removed_count,
+        };
+        if delta.is_noop() {
             return;
         }
         let mut total = self
             .model_totals
             .entry(model.to_string())
             .or_insert((0.0, 0));
-        total.0 += added_sum;
-        total.1 += added_count;
-        total.0 -= removed_sum;
-        total.1 = total.1.saturating_sub(removed_count);
+        total.0 += delta.added_sum;
+        total.1 += delta.added_count;
+        total.0 -= delta.removed_sum;
+        total.1 = total.1.saturating_sub(delta.removed_count);
         if total.1 == 0 {
             drop(total);
             self.model_totals.remove(model);
