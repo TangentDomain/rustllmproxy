@@ -123,9 +123,9 @@ impl Proxy {
         let t_start = Instant::now();
         let fallback_deadline = t_start + Duration::from_secs(self.config.server.fallback_timeout_secs);
         let (parts, body) = req.into_parts();
-        let path = parts.uri.path().to_string();
+        let path = parts.uri.path();
 
-        let protocol = parts.extensions.get::<String>().cloned();
+        let protocol = parts.extensions.get::<String>().map(String::as_str);
 
         let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
             Ok(b) => b,
@@ -150,13 +150,21 @@ impl Proxy {
                 // Weighted random by observed model tok/s (aggregated across backends).
                 // If no data yet for any model, fall back to uniform random.
                 let raw: Vec<f64> = group.iter().map(|m| self.store.avg_for_model(m)).collect();
-                let with_data: Vec<f64> = raw.iter().copied().filter(|&w| w != 1.0).collect();
-                let weights: Vec<f64> = if with_data.is_empty() {
-                    raw.clone()
-                } else {
-                    let avg_w = with_data.iter().sum::<f64>() / with_data.len() as f64;
-                    raw.iter().map(|&w| if w == 1.0 { avg_w } else { w }).collect()
-                };
+                let mut data_sum = 0.0;
+                let mut data_count = 0usize;
+                for &w in &raw {
+                    if w != 1.0 {
+                        data_sum += w;
+                        data_count += 1;
+                    }
+                }
+                let mut weights = raw.clone();
+                if data_count > 0 {
+                    let avg_w = data_sum / data_count as f64;
+                    for w in &mut weights {
+                        if *w == 1.0 { *w = avg_w; }
+                    }
+                }
                 let total_w: f64 = weights.iter().sum();
                 let (idx, reason, r_opt) = if total_w <= 0.0 {
                     let idx = rand::thread_rng().gen_range(0..group.len());
@@ -196,7 +204,7 @@ impl Proxy {
         let chain = self.config.get_fallback_chain(&model);
 
         for try_model in &chain {
-            let all_backends = self.config.find_backends_for_model(try_model, protocol.as_deref());
+            let all_backends = self.config.find_backends_for_model(try_model, protocol);
             if all_backends.is_empty() {
                 info!("No backend supports model={try_model}, skipping");
                 continue;
@@ -220,13 +228,25 @@ impl Proxy {
 
             // Adaptive: weighted random by recent tok/s, faster backends get more traffic
             // Backends with no data get the average of those with data (proportional, no starvation)
-            let weights: Vec<f64> = healthy.iter().map(|b| self.metrics.avg(&b.name)).collect();
-            let avg_w = if weights.iter().any(|&w| w > 1.0) {
-                weights.iter().filter(|&&w| w > 1.0).sum::<f64>() / weights.iter().filter(|&&w| w > 1.0).count() as f64
+            let mut weights = Vec::with_capacity(healthy.len());
+            let mut data_sum = 0.0;
+            let mut data_count = 0usize;
+            for b in &healthy {
+                let w = self.metrics.avg(&b.name);
+                if w > 1.0 {
+                    data_sum += w;
+                    data_count += 1;
+                }
+                weights.push(w);
+            }
+            let avg_w = if data_count > 0 {
+                data_sum / data_count as f64
             } else {
                 1.0 // no data yet → equal default weight
             };
-            let weights: Vec<f64> = weights.iter().map(|&w| if w <= 1.0 { avg_w } else { w }).collect();
+            for w in &mut weights {
+                if *w <= 1.0 { *w = avg_w; }
+            }
             let total_w: f64 = weights.iter().sum();
             let r = rand::random::<f64>() * total_w;
             let mut cum = 0.0;
@@ -237,7 +257,7 @@ impl Proxy {
                 // Prepare body: model patch + backend-specific preprocessing
                 let body_bytes = prepare_request_body(&bytes, &original_model, try_model, &resolved, selected);
 
-                match self.do_forward(&path, &parts.headers, body_bytes, selected).await {
+                match self.do_forward(path, &parts.headers, body_bytes, selected).await {
                     Ok((resp, ttfb, is_stream)) => {
                         let ttfb_ms = ttfb.as_millis() as u64;
                         info!("Responding: {} -> {} via {} | ttfb={}ms, body={}B, stream={}",
@@ -871,7 +891,7 @@ fn instrument_stream(
                                             first_text_token = Some(Instant::now());
                                         }
                                         // Accumulate content text for token counting
-                                        if let Some(s) = extract_content_text(text) { content_text.push_str(&s); }
+                                        append_content_text(text, &mut content_text);
                                         if let Some(n) = extract_completion_tokens(text) {
                                             backend_tokens = Some(n);
                                         }
@@ -950,38 +970,41 @@ fn instrument_stream(
 
 /// Extract text from content, reasoning_content, and thinking fields.
 /// Accumulates raw UTF-8 bytes (no serde_json, non-blocking).
-fn extract_content_text(json: &str) -> Option<String> {
+fn append_content_text(json: &str, content_text: &mut String) {
     let bytes = json.as_bytes();
-    let mut buf = Vec::with_capacity(64);
-    fn extract_value(bytes: &[u8], start: usize, buf: &mut Vec<u8>) {
-        const BS: u8 = 92;
-        let mut j = start;
-        while j < bytes.len() {
-            let b = bytes[j];
-            if b == BS && j + 1 < bytes.len() {
-                match bytes[j + 1] {
-                    b'"' | BS | b'/' => { buf.push(bytes[j + 1]); j += 2; }
-                    b'n' => { buf.push(10); j += 2; }
-                    b't' => { buf.push(9); j += 2; }
-                    b'r' => { buf.push(13); j += 2; }
-                    _ => { buf.push(b); buf.push(bytes[j + 1]); j += 2; }
-                }
-            } else if b == b'"' { break; }
-            else { buf.push(b); j += 1; }
-        }
-    }
     if let Some(pos) = bytes.windows(b"\"reasoning_content\":\"".len()).position(|w| w == *b"\"reasoning_content\":\"") {
-        extract_value(bytes, pos + b"\"reasoning_content\":\"".len(), &mut buf);
+        append_json_string_value(bytes, pos + b"\"reasoning_content\":\"".len(), content_text);
     }
     if let Some(pos) = bytes.windows(b"\"content\":\"".len()).position(|w| w == *b"\"content\":\"") {
         if pos == 0 || bytes[pos - 1] != b'_' {
-            extract_value(bytes, pos + b"\"content\":\"".len(), &mut buf);
+            append_json_string_value(bytes, pos + b"\"content\":\"".len(), content_text);
         }
     }
     if let Some(pos) = bytes.windows(b"\"thinking\":\"".len()).position(|w| w == *b"\"thinking\":\"") {
-        extract_value(bytes, pos + b"\"thinking\":\"".len(), &mut buf);
+        append_json_string_value(bytes, pos + b"\"thinking\":\"".len(), content_text);
     }
-    if buf.is_empty() { None } else { String::from_utf8(buf).ok() }
+}
+
+fn append_json_string_value(bytes: &[u8], start: usize, out: &mut String) {
+    let mut j = start;
+    let mut escaped = false;
+    while j < bytes.len() {
+        let b = bytes[j];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            let json_start = start.saturating_sub(1);
+            if let Ok(value) = serde_json::from_slice::<String>(&bytes[json_start..=j]) {
+                out.push_str(&value);
+            } else if let Ok(value) = std::str::from_utf8(&bytes[start..j]) {
+                out.push_str(value);
+            }
+            return;
+        }
+        j += 1;
+    }
 }
 
 /// Extract completion_tokens from backend's final usage chunk.
@@ -1005,5 +1028,27 @@ fn count_tokens(text: &str) -> u32 {
     static BPE: OnceLock<tiktoken_rs::CoreBPE> = OnceLock::new();
     let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("tiktoken init failed"));
     bpe.encode_ordinary(text).len() as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_content_text_decodes_standard_json_escapes() {
+        let mut out = String::new();
+        append_content_text(r#"{"content":"hello\n\u4e16\u754c\uD83D\uDE03"}"#, &mut out);
+        assert_eq!(out, "hello\n世界😃");
+    }
+
+    #[test]
+    fn append_content_text_preserves_multiple_supported_fields() {
+        let mut out = String::new();
+        append_content_text(
+            r#"{"reasoning_content":"think\t","content":"answer","thinking":"done"}"#,
+            &mut out,
+        );
+        assert_eq!(out, "think\tanswerdone");
+    }
 }
 
