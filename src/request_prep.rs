@@ -3,66 +3,46 @@ use bytes::Bytes;
 use crate::config::Backend;
 
 /// 从 JSON bytes 中快速提取 "model" 字段值（手动扫描，避免完整反序列化）
-/// 优化：只扫描前 2KB（model 字段始终在 JSON 开头附近）
+/// 注意：请求体已在 Proxy::handle 中被 cap 为 10 MiB，因此扫描完整 bytes
 #[inline]
 pub(crate) fn extract_model_from_json(bytes: &[u8]) -> String {
-    const PATTERN: &[u8] = b"\"model\"";
-    // model 字段始终在 JSON 开头附近，只扫描前 2KB
-    let scan_range = &bytes[..bytes.len().min(2048)];
-    if let Some(pos) = scan_range.windows(PATTERN.len()).position(|w| w == PATTERN) {
-        let after_key = &bytes[pos + PATTERN.len()..];
-        let after_colon = skip_whitespace(after_key);
-        if !after_colon.is_empty() && after_colon[0] == b':' {
-            let after_colon = skip_whitespace(&after_colon[1..]);
-            if !after_colon.is_empty() && after_colon[0] == b'\"' {
-                if let Some(end) = after_colon[1..].iter().position(|&c| c == b'\"') {
-                    let model_bytes = &after_colon[1..1 + end];
-                    return std::str::from_utf8(model_bytes)
-                        .map(|s| s.to_owned())
-                        .unwrap_or_default();
-                }
-            }
-        }
-    }
-    String::new()
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()?
+                .get("model")?
+                .as_str()
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_default()
 }
 
 /// 从 JSON bytes 中快速提取 max_tokens / max_completion_tokens（手动扫描，避免完整反序列化）
 pub(crate) fn extract_max_tokens(bytes: &[u8]) -> Option<u32> {
-    // 扫描前 8KB（max_tokens 通常在 model 附近）
-    let scan_range = &bytes[..bytes.len().min(8192)];
-    const MAX_TOK: &[u8] = b"\"max_tokens\"";
-    const MAX_COMP_TOK: &[u8] = b"\"max_completion_tokens\"";
-    for key in [MAX_TOK, MAX_COMP_TOK] {
-        if let Some(pos) = scan_range.windows(key.len()).position(|w| w == key) {
-            let after_key = &bytes[pos + key.len()..];
-            let after_colon = skip_whitespace(after_key);
-            if !after_colon.is_empty() && after_colon[0] == b':' {
-                let after_colon = skip_whitespace(&after_colon[1..]);
-                if !after_colon.is_empty()
-                    && (after_colon[0].is_ascii_digit() || after_colon[0] == b'-')
-                {
-                    let mut val: u32 = 0;
-                    for &b in after_colon.iter().take(10) {
-                        if b.is_ascii_digit() {
-                            val = val * 10 + (b - b'0') as u32;
-                        } else {
-                            break;
-                        }
-                    }
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            let obj = value.as_object()?;
+            obj.get("max_tokens")
+                .or_else(|| obj.get("max_completion_tokens"))?
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+        })
 }
 
-#[inline]
-fn skip_whitespace(s: &[u8]) -> &[u8] {
-    s.iter()
-        .position(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
-        .map_or(&[], |i| &s[i..])
+pub(crate) fn has_negative_max_tokens(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            let obj = value.as_object()?;
+            Some(
+                obj.get("max_tokens")
+                    .or_else(|| obj.get("max_completion_tokens"))
+                    .is_some_and(|v| v.as_i64().is_some_and(|n| n < 0)),
+            )
+        })
+        .unwrap_or(false)
 }
 
 /// 字节级替换 JSON 中的 model 字段值，避免完整反序列化+序列化。
@@ -88,7 +68,7 @@ fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
     while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
         pos += 1;
     }
-    if pos >= bytes.len() || bytes[pos] != b'\"' {
+    if pos >= bytes.len() || bytes[pos] != b'"' {
         return bytes.to_vec();
     }
     let value_start = pos + 1;
@@ -100,7 +80,7 @@ fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
             escaped = false;
         } else if b == b'\\' {
             escaped = true;
-        } else if b == b'\"' {
+        } else if b == b'"' {
             break;
         }
         value_end += 1;
@@ -197,12 +177,12 @@ fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
             if b == b'\\' && i + 1 < bytes.len() {
                 i += 1;
                 cleaned.push(bytes[i]);
-            } else if b == b'\"' {
+            } else if b == b'"' {
                 in_string = false;
             }
         } else {
             match b {
-                b'\"' => {
+                b'"' => {
                     in_string = true;
                     cleaned.push(b);
                 }
@@ -228,5 +208,93 @@ fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
         serde_json::to_vec(&val).unwrap_or(cleaned)
     } else {
         cleaned
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ─── extract_model_from_json Tests ──────────────────────────
+
+    #[test]
+    fn test_extract_model_from_json_basic() {
+        let body = br#"{"model":"glm-5.1","messages":[{"role":"user","content":"hello"}]}"#;
+        assert_eq!(extract_model_from_json(body), "glm-5.1");
+    }
+
+    #[test]
+    fn test_extract_model_from_json_with_prefix_padding() {
+        // 测试 top-level model 字段在 >2KB 前缀之后的情况
+        let prefix = "{\"system\":\"".to_owned() + &"x".repeat(3000) + "\",";
+        let body =
+            prefix + "\"model\":\"glm-4.7\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+        let body_bytes = body.as_bytes();
+        assert_eq!(extract_model_from_json(body_bytes), "glm-4.7");
+    }
+
+    #[test]
+    fn test_extract_model_from_json_ignores_nested_model() {
+        let body = br#"{"metadata":{"model":"bad-model"},"model":"glm-5.1","messages":[]}"#;
+        assert_eq!(extract_model_from_json(body), "glm-5.1");
+    }
+
+    #[test]
+    fn test_extract_model_from_json_not_found() {
+        let body = br#"{"messages":[{"role":"user","content":"hello"}]}"#;
+        assert_eq!(extract_model_from_json(body), "");
+    }
+
+    // ─── extract_max_tokens Tests ──────────────────────────────
+
+    #[test]
+    fn test_extract_max_tokens_basic() {
+        let body = br#"{"model":"glm-5.1","max_tokens":1024,"messages":[]}"#;
+        assert_eq!(extract_max_tokens(body), Some(1024));
+    }
+
+    #[test]
+    fn test_extract_max_tokens_negative() {
+        let body = br#"{"model":"glm-5.1","max_tokens":-1,"messages":[]}"#;
+        // 负数应该返回 None，不返回 Some(0)
+        assert_eq!(extract_max_tokens(body), None);
+    }
+
+    #[test]
+    fn test_extract_max_tokens_zero() {
+        let body = br#"{"model":"glm-5.1","max_tokens":0,"messages":[]}"#;
+        assert_eq!(extract_max_tokens(body), Some(0));
+    }
+
+    #[test]
+    fn test_extract_max_tokens_missing() {
+        let body = br#"{"model":"glm-5.1","messages":[]}"#;
+        assert_eq!(extract_max_tokens(body), None);
+    }
+
+    #[test]
+    fn test_extract_max_tokens_completion_tokens() {
+        let body = br#"{"model":"glm-5.1","max_completion_tokens":2048,"messages":[]}"#;
+        assert_eq!(extract_max_tokens(body), Some(2048));
+    }
+
+    #[test]
+    fn test_extract_max_tokens_large_value() {
+        let body = br#"{"model":"glm-5.1","max_tokens":999999,"messages":[]}"#;
+        assert_eq!(extract_max_tokens(body), Some(999999));
+    }
+
+    #[test]
+    fn test_has_negative_max_tokens_ignores_nested_negative_value() {
+        let body =
+            br#"{"metadata":{"max_tokens":-1},"model":"glm-5.1","max_tokens":16,"messages":[]}"#;
+        assert_eq!(extract_max_tokens(body), Some(16));
+        assert!(!has_negative_max_tokens(body));
+    }
+
+    #[test]
+    fn test_has_negative_max_tokens_detects_top_level_negative_value() {
+        let body = br#"{"model":"glm-5.1","max_tokens":-1,"messages":[]}"#;
+        assert!(has_negative_max_tokens(body));
     }
 }

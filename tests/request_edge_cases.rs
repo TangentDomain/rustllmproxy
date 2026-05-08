@@ -117,7 +117,7 @@ async fn counting_openai_handler(
     State(hits): State<Arc<AtomicUsize>>,
     Json(payload): Json<serde_json::Value>,
 ) -> Json<serde_json::Value> {
-    assert_eq!(payload["model"], "mock-model");
+    assert!(payload["model"] == "mock-model" || payload["model"] == "glm-4.7");
     hits.fetch_add(1, Ordering::SeqCst);
     Json(serde_json::json!({
         "id": "edge-case-test",
@@ -128,4 +128,136 @@ async fn counting_openai_handler(
             "finish_reason": "stop"
         }]
     }))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn late_model_field_after_large_prefix_is_extracted() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_addr, mock_handle) = spawn_counting_mock(Arc::clone(&hits)).await;
+    let config = TestConfigBuilder::new()
+        .backend(TestBackend::openai("mock-backend", mock_addr).with_models(&["glm-4.7"]))
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    // 构建一个 JSON，model 字段在 >2KB 前缀之后
+    let prefix = "{\"metadata\":\"".to_owned() + &"x".repeat(3000) + "\",";
+    let body =
+        prefix + "\"model\":\"glm-4.7\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}";
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/openai/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("late model request");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn negative_max_tokens_rejected() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_addr, mock_handle) = spawn_counting_mock(Arc::clone(&hits)).await;
+    let config = TestConfigBuilder::new()
+        .backend(TestBackend::anthropic("mock-backend", mock_addr))
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    let body = serde_json::to_string(&serde_json::json!({
+        "model": "mock-model",
+        "max_tokens": -1,
+        "messages": [{"role": "user", "content": "test"}]
+    }))
+    .expect("serialize negative max_tokens body");
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/anthropic/v1/messages"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .header("Content-Type", "application/json")
+        .header("anthropic-version", "2023-06-01")
+        .body(body)
+        .send()
+        .await
+        .expect("negative max_tokens request");
+
+    // 负数 max_tokens 应该返回错误
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_model_does_not_override_top_level_model() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_addr, mock_handle) = spawn_counting_mock(Arc::clone(&hits)).await;
+    let config = TestConfigBuilder::new()
+        .backend(TestBackend::openai("mock-backend", mock_addr).with_models(&["mock-model"]))
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    let body = serde_json::to_string(&serde_json::json!({
+        "metadata": {"model": "unsupported-nested-model"},
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "test"}]
+    }))
+    .expect("serialize nested model body");
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/openai/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("nested model request");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nested_negative_max_tokens_does_not_reject_request() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_addr, mock_handle) = spawn_counting_mock(Arc::clone(&hits)).await;
+    let config = TestConfigBuilder::new()
+        .backend(TestBackend::openai("mock-backend", mock_addr))
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    let body = serde_json::to_string(&serde_json::json!({
+        "metadata": {"max_tokens": -1},
+        "model": "mock-model",
+        "max_tokens": 16,
+        "messages": [{"role": "user", "content": "test"}]
+    }))
+    .expect("serialize nested max_tokens body");
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/openai/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("nested max_tokens request");
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    proxy_handle.abort();
+    mock_handle.abort();
 }
