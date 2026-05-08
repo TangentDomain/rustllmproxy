@@ -18,7 +18,6 @@ pub struct BackendState {
     /// 标记为 unhealthy 的时间戳（毫秒），用于被动恢复
     unhealthy_since: AtomicU64,
 }
-
 pub struct WeightedRoundRobin {
     backends: Vec<Arc<BackendState>>,
     retry: u32,
@@ -196,6 +195,15 @@ impl WeightedRoundRobin {
                 false
             }
         })
+    }
+
+    /// 返回指定 backend 的健康状态（会触发被动恢复）。
+    ///
+    /// 该方法是 balancer 与 proxy 编排之间的最小耦合点：
+    /// - proxy 只关心“是否可以尝试该 backend”
+    /// - 被动恢复的时序与状态转移由 balancer 负责
+    pub fn is_healthy(&self, backend_name: &str) -> bool {
+        self.is_healthy_by_name(backend_name)
     }
 
     /// 启动后台健康检查（已禁用 - 不同 provider API 格式不统一）

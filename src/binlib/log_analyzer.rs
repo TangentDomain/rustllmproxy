@@ -29,7 +29,8 @@ pub struct RequestRecord {
 
 pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
     let timestamp_end = s.find(' ')?;
-    let naive = NaiveDateTime::parse_from_str(&s[..timestamp_end], "%Y-%m-%dT%H:%M:%S%.6fZ").ok()?;
+    let naive =
+        NaiveDateTime::parse_from_str(&s[..timestamp_end], "%Y-%m-%dT%H:%M:%S%.6fZ").ok()?;
     Some(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
@@ -236,10 +237,7 @@ fn apply_record(stats: &mut LogStats, record: &RequestRecord) {
     }
 
     let model_key = record.requested_model.clone();
-    let m = stats
-        .model_stats
-        .entry(model_key)
-        .or_default();
+    let m = stats.model_stats.entry(model_key).or_default();
     m.count += 1;
     if is_fallback {
         m.fallback_count += 1;
@@ -315,29 +313,25 @@ pub fn render_markdown(log_path: &str, generated_at: &str, stats: &LogStats) -> 
     writeln!(
         &mut out,
         "| Fallback请求 | {} | {:.1}% |",
-        stats.fallback_count,
-        fallback_pct
+        stats.fallback_count, fallback_pct
     )
     .ok();
     writeln!(
         &mut out,
         "| 错误请求 | {} | {:.1}% |",
-        stats.error_count,
-        error_pct
+        stats.error_count, error_pct
     )
     .ok();
     writeln!(
         &mut out,
         "| 流式请求 | {} | {:.1}% |",
-        stats.stream_count,
-        stream_pct
+        stats.stream_count, stream_pct
     )
     .ok();
     writeln!(
         &mut out,
         "| 非流式 | {} | {:.1}% |",
-        stats.non_stream_count,
-        non_stream_pct
+        stats.non_stream_count, non_stream_pct
     )
     .ok();
     writeln!(&mut out).ok();
@@ -555,7 +549,10 @@ mod tests {
     fn test_extract_field_stops_on_delimiters() {
         let line = "foo model=glm-5.1, path=/v1/messages | rest";
         assert_eq!(extract_field(line, "model").as_deref(), Some("glm-5.1"));
-        assert_eq!(extract_field(line, "path").as_deref(), Some("/v1/messages "));
+        assert_eq!(
+            extract_field(line, "path").as_deref(),
+            Some("/v1/messages ")
+        );
     }
 
     #[test]
@@ -583,7 +580,10 @@ mod tests {
             stats.fallback_chains.get("glm-5.1 -> glm-4.7").copied(),
             Some(1)
         );
-        assert_eq!(stats.errors_by_type.get("all_backends_exhausted").copied(), Some(1));
+        assert_eq!(
+            stats.errors_by_type.get("all_backends_exhausted").copied(),
+            Some(1)
+        );
 
         let m = stats.model_stats.get("glm-5.1").unwrap();
         assert_eq!(m.count, 1);

@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::request_prep::{extract_max_tokens, extract_model_from_json, prepare_request_body};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
@@ -17,13 +18,14 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{error, info, info_span, warn};
 
-use crate::balancer::WeightedRoundRobin;
 use crate::backend_metrics::BackendMetrics;
+use crate::balancer::WeightedRoundRobin;
 use crate::config::{Backend, Config};
 use crate::metrics::MetricsStore;
 use crate::middleware::RateLimiter;
+use crate::selection::{choose_weighted_index, WeightFill};
 use crate::streaming::instrument_stream;
-use rand::Rng;
+
 /// 转发错误分类，决定后续行为
 enum ForwardError {
     /// 4xx 客户端错误 → 直接返回，不fallback
@@ -77,7 +79,7 @@ impl Proxy {
 
     /// 检查后端是否健康（O(1) 查找）
     fn is_healthy(&self, b: &Backend) -> bool {
-        self.balancer.is_healthy_by_name(&b.name)
+        self.balancer.is_healthy(&b.name)
     }
 
     /// Main proxy handler: follow fallback chain, route each model to matching backends.
@@ -127,40 +129,17 @@ impl Proxy {
                 // Weighted random by observed model tok/s (aggregated across backends).
                 // If no data yet for any model, fall back to uniform random.
                 let raw: Vec<f64> = group.iter().map(|m| self.store.avg_for_model(m)).collect();
-                let mut data_sum = 0.0;
-                let mut data_count = 0usize;
-                for &w in &raw {
-                    if w != 1.0 {
-                        data_sum += w;
-                        data_count += 1;
-                    }
-                }
-                let mut weights = raw.clone();
-                if data_count > 0 {
-                    let avg_w = data_sum / data_count as f64;
-                    for w in &mut weights {
-                        if *w == 1.0 {
-                            *w = avg_w;
-                        }
-                    }
-                }
-                let total_w: f64 = weights.iter().sum();
-                let (idx, reason, r_opt) = if total_w <= 0.0 {
-                    let idx = rand::thread_rng().gen_range(0..group.len());
-                    (idx, "uniform(no_data)", None)
+                let detail = choose_weighted_index(
+                    group.len(),
+                    |idx| raw[idx],
+                    WeightFill::MissingEqualsOne,
+                );
+                let reason = if detail.used_uniform_fallback {
+                    "uniform(no_data)"
                 } else {
-                    let r = rand::random::<f64>() * total_w;
-                    let mut cum = 0.0;
-                    let idx = weights
-                        .iter()
-                        .position(|w| {
-                            cum += *w;
-                            cum >= r
-                        })
-                        .unwrap_or(0);
-                    (idx, "weighted(tok/s)", Some(r))
+                    "weighted(tok/s)"
                 };
-                let chosen = group[idx].clone();
+                let chosen = group[detail.index].clone();
                 mapping_logged = true;
                 info!(
                     "Model mapping: {} -> {} | reason={}, candidates={:?}, raw_tok_s={:?}, weights={:?}, picked_index={}/{}, random_value={}, total_weight={}",
@@ -169,11 +148,14 @@ impl Proxy {
                     reason,
                     group,
                     raw,
-                    weights,
-                    idx,
+                    detail.weights,
+                    detail.index,
                     group.len(),
-                    r_opt.map(|v| format!("{v:.2}")).unwrap_or_else(|| "N/A".to_string()),
-                    total_w
+                    detail
+                        .random_value
+                        .map(|v| format!("{v:.2}"))
+                        .unwrap_or_else(|| "N/A".to_string()),
+                    detail.total_weight
                 );
                 chosen
             }
@@ -219,40 +201,15 @@ impl Proxy {
 
             // Adaptive: weighted random by recent tok/s, faster backends get more traffic
             // Backends with no data get the average of those with data (proportional, no starvation)
-            let mut weights = Vec::with_capacity(healthy.len());
-            let mut data_sum = 0.0;
-            let mut data_count = 0usize;
-            for b in &healthy {
-                let w = self.metrics.avg(&b.name);
-                if w > 1.0 {
-                    data_sum += w;
-                    data_count += 1;
-                }
-                weights.push(w);
-            }
-            let avg_w = if data_count > 0 {
-                data_sum / data_count as f64
-            } else {
-                1.0 // no data yet → equal default weight
-            };
-            for w in &mut weights {
-                if *w <= 1.0 {
-                    *w = avg_w;
-                }
-            }
-            let total_w: f64 = weights.iter().sum();
-            let r = rand::random::<f64>() * total_w;
-            let mut cum = 0.0;
-            let start = weights
-                .iter()
-                .position(|w| {
-                    cum += w;
-                    cum >= r
-                })
-                .unwrap_or(0);
+            let detail = choose_weighted_index(
+                healthy.len(),
+                |idx| self.metrics.avg(&healthy[idx].name),
+                WeightFill::MissingLessOrEqualOne,
+            );
+            let start = detail.index;
             for i in 0..healthy.len() {
                 let selected = &healthy[(start + i) % healthy.len()];
-                let resolved = selected.resolve_model(try_model);
+                let resolved = crate::model_resolution::resolved_model(selected, try_model);
                 // Prepare body: model patch + backend-specific preprocessing
                 let body_bytes =
                     prepare_request_body(&bytes, &original_model, try_model, &resolved, selected);
@@ -261,7 +218,7 @@ impl Proxy {
                     .do_forward(path, &parts.headers, body_bytes, selected)
                     .await
                 {
-                    Ok((resp, ttfb, is_stream)) => {
+                    Ok((mut resp, ttfb, is_stream)) => {
                         let ttfb_ms = ttfb.as_millis() as u64;
                         info!(
                             "Responding: {} -> {} via {} | ttfb={}ms, body={}B, stream={}",
@@ -274,9 +231,8 @@ impl Proxy {
                             let first_chunk_timeout = Duration::from_secs(
                                 self.config.server.stream_first_chunk_timeout_secs,
                             );
-                            let stream_total_timeout = Duration::from_secs(
-                                self.config.server.timeout_secs,
-                            );
+                            let stream_total_timeout =
+                                Duration::from_secs(self.config.server.timeout_secs);
                             let (new_body, done_rx) = instrument_stream(
                                 resp.into_body(),
                                 model.clone(),
@@ -318,7 +274,6 @@ impl Proxy {
                                 "Done: {} -> {} via {} | total={}ms, ttfb={}ms",
                                 model, resolved, selected.name, total_ms, ttfb_ms
                             );
-                            let mut resp = resp;
                             resp.headers_mut()
                                 .insert("x-request-id", request_id.parse().unwrap());
                             resp.headers_mut()
@@ -525,7 +480,7 @@ pub async fn auth_layer(
         return Ok(next.run(request).await);
     }
 
-    let key = extract_bearer_key(&request);
+    let key = crate::middleware::extract_client_credential_from_request(&request);
     let key = match key {
         Some(k) => k,
         None => {
@@ -552,7 +507,6 @@ pub async fn auth_layer(
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
-
     let api_key = proxy.config().find_api_key(&key);
     let api_key = match api_key {
         Some(k) => k,
@@ -569,7 +523,6 @@ pub async fn auth_layer(
     };
 
     if !proxy.limiter().check(&key, api_key.rate_limit) {
-        info!("Rate limited: {}", api_key.name);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
@@ -581,250 +534,17 @@ pub async fn auth_layer(
     Ok(next.run(request).await)
 }
 
-/// 从 JSON bytes 中快速提取 "model" 字段值（手动扫描，避免完整反序列化）
-/// 优化：只扫描前 2KB（model 字段始终在 JSON 开头附近）
-#[inline]
-fn extract_model_from_json(bytes: &[u8]) -> String {
-    const PATTERN: &[u8] = b"\"model\"";
-    // model 字段始终在 JSON 开头附近，只扫描前 2KB
-    let scan_range = &bytes[..bytes.len().min(2048)];
-    if let Some(pos) = scan_range.windows(PATTERN.len()).position(|w| w == PATTERN) {
-        let after_key = &bytes[pos + PATTERN.len()..];
-        let after_colon = skip_whitespace(after_key);
-        if !after_colon.is_empty() && after_colon[0] == b':' {
-            let after_colon = skip_whitespace(&after_colon[1..]);
-            if !after_colon.is_empty() && after_colon[0] == b'"' {
-                if let Some(end) = after_colon[1..].iter().position(|&c| c == b'"') {
-                    let model_bytes = &after_colon[1..1 + end];
-                    return std::str::from_utf8(model_bytes)
-                        .map(|s| s.to_owned())
-                        .unwrap_or_default();
-                }
-            }
-        }
-    }
-    String::new()
-}
+// ---- Request body inspection / rewrite boundary moved to crate::request_prep ----
 
-/// 从 JSON bytes 中快速提取 max_tokens / max_completion_tokens（手动扫描，避免完整反序列化）
-fn extract_max_tokens(bytes: &[u8]) -> Option<u32> {
-    // 扫描前 8KB（max_tokens 通常在 model 附近）
-    let scan_range = &bytes[..bytes.len().min(8192)];
-    const MAX_TOK: &[u8] = b"\"max_tokens\"";
-    const MAX_COMP_TOK: &[u8] = b"\"max_completion_tokens\"";
-    for key in [MAX_TOK, MAX_COMP_TOK] {
-        if let Some(pos) = scan_range.windows(key.len()).position(|w| w == key) {
-            let after_key = &bytes[pos + key.len()..];
-            let after_colon = skip_whitespace(after_key);
-            if !after_colon.is_empty() && after_colon[0] == b':' {
-                let after_colon = skip_whitespace(&after_colon[1..]);
-                if !after_colon.is_empty()
-                    && (after_colon[0].is_ascii_digit() || after_colon[0] == b'-')
-                {
-                    let mut val: u32 = 0;
-                    for &b in after_colon.iter().take(10) {
-                        if b.is_ascii_digit() {
-                            val = val * 10 + (b - b'0') as u32;
-                        } else {
-                            break;
-                        }
-                    }
-                    return Some(val);
-                }
-            }
-        }
-    }
-    None
-}
-#[inline]
-fn skip_whitespace(s: &[u8]) -> &[u8] {
-    s.iter()
-        .position(|&c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
-        .map_or(&[], |i| &s[i..])
-}
-
-/// 字节级替换 JSON 中的 model 字段值，避免完整反序列化+序列化。
-/// 优化：先找匹配位置，然后一次性构建结果，避免逐字节 push。
-fn patch_json_model(bytes: &[u8], old_model: &str, new_model: &str) -> Vec<u8> {
-    if old_model == new_model {
-        return bytes.to_vec();
-    }
-    let pattern = "\"model\"".to_string();
-    let p = pattern.as_bytes();
-    let Some(mut pos) = bytes.windows(p.len()).position(|w| w == p) else {
-        return bytes.to_vec();
-    };
-    pos += p.len();
-
-    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
-        pos += 1;
-    }
-    if pos >= bytes.len() || bytes[pos] != b':' {
-        return bytes.to_vec();
-    }
-    pos += 1;
-    while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\n' | b'\r') {
-        pos += 1;
-    }
-    if pos >= bytes.len() || bytes[pos] != b'\"' {
-        return bytes.to_vec();
-    }
-    let value_start = pos + 1;
-    let mut value_end = value_start;
-    let mut escaped = false;
-    while value_end < bytes.len() {
-        let b = bytes[value_end];
-        if escaped {
-            escaped = false;
-        } else if b == b'\\' {
-            escaped = true;
-        } else if b == b'\"' {
-            break;
-        }
-        value_end += 1;
-    }
-
-    if value_end >= bytes.len() {
-        return bytes.to_vec();
-    }
-    if std::str::from_utf8(&bytes[value_start..value_end]).ok() != Some(old_model) {
-        return bytes.to_vec();
-    }
-
-    let mut result =
-        Vec::with_capacity(bytes.len() + new_model.len().saturating_sub(old_model.len()));
-    result.extend_from_slice(&bytes[..value_start]);
-    result.extend_from_slice(new_model.as_bytes());
-    result.extend_from_slice(&bytes[value_end..]);
-    result
-}
-
-/// Prepare request body: apply model patch, then backend-specific transforms.
-/// Preserves zero-copy path for unaffected backends (especially OpenAI).
-fn prepare_request_body(
-    bytes: &Bytes,
-    original_model: &str,
-    try_model: &str,
-    resolved: &str,
-    backend: &Backend,
-) -> Bytes {
-    let needs_model_patch = resolved != try_model || original_model != try_model;
-    let needs_strip = !backend.strip_params.is_empty();
-    let needs_sanitize = backend.name == "zhipu-anthropic";
-    // MiniMax Anthropic needs max_completion_tokens → max_tokens rename
-    let needs_max_tokens_rename =
-        backend.protocol == "anthropic" && backend.name.starts_with("minimax-anthropic");
-
-    if !needs_model_patch && !needs_strip && !needs_sanitize && !needs_max_tokens_rename {
-        return bytes.clone();
-    }
-
-    let base: Vec<u8> = if needs_model_patch {
-        patch_json_model(bytes, original_model, resolved)
-    } else {
-        bytes.to_vec()
-    };
-
-    // Step 2: sanitize for strict JSON parsers (zhipu-anthropic)
-    let base = if needs_sanitize {
-        sanitize_json_bytes(&base)
-    } else {
-        base
-    };
-
-    // Step 3: strip configured params + optional max_completion_tokens rename
-    if !needs_strip && !needs_max_tokens_rename {
-        return Bytes::from(base);
-    }
-
-    let mut val: serde_json::Value = match serde_json::from_slice(&base) {
-        Ok(v) => v,
-        Err(_) => return Bytes::from(base),
-    };
-
-    if let Some(obj) = val.as_object_mut() {
-        for field in &backend.strip_params {
-            obj.remove(field);
-        }
-        if needs_max_tokens_rename {
-            if let Some(max_comp) = obj.remove("max_completion_tokens") {
-                obj.entry("max_tokens").or_insert(max_comp);
-            }
-        }
-    }
-
-    Bytes::from(serde_json::to_vec(&val).unwrap_or(base))
-}
-
-/// Sanitize JSON bytes: strip trailing commas, BOM, and re-serialize cleanly.
-/// Used for zhipu-anthropic which has a strict JSON parser that rejects trailing commas.
-fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
-    // Fast path: already valid JSON, just re-serialize for clean output
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes) {
-        return serde_json::to_vec(&val).unwrap_or_else(|_| bytes.to_vec());
-    }
-
-    // Slow path: strip trailing commas then retry
-    let mut cleaned = Vec::with_capacity(bytes.len());
-    let mut in_string = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_string {
-            cleaned.push(b);
-            if b == b'\\' && i + 1 < bytes.len() {
-                i += 1;
-                cleaned.push(bytes[i]);
-            } else if b == b'"' {
-                in_string = false;
-            }
-        } else {
-            match b {
-                b'"' => {
-                    in_string = true;
-                    cleaned.push(b);
-                }
-                b',' => {
-                    // Look ahead: skip comma if followed by } or ]
-                    let mut j = i + 1;
-                    while j < bytes.len() && matches!(bytes[j], b' ' | b'\t' | b'\n' | b'\r') {
-                        j += 1;
-                    }
-                    if j < bytes.len() && (bytes[j] == b'}' || bytes[j] == b']') {
-                        // Trailing comma: skip it
-                    } else {
-                        cleaned.push(b);
-                    }
-                }
-                _ => cleaned.push(b),
-            }
-        }
-        i += 1;
-    }
-
-    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&cleaned) {
-        serde_json::to_vec(&val).unwrap_or(cleaned)
-    } else {
-        cleaned
-    }
-}
-
+#[cfg(test)]
 fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
-    if let Some(auth) = req.headers().get("authorization") {
-        if let Ok(v) = auth.to_str() {
-            if let Some(key) = v.strip_prefix("Bearer ") {
-                return Some(key.to_string());
-            }
-        }
-    }
-    if let Some(query) = req.uri().query() {
-        for pair in query.split('&') {
-            if let Some(val) = pair.strip_prefix("api_key=") {
-                return Some(val.to_string());
-            }
-        }
-    }
-    None
+    crate::middleware::extract_client_credential_from_request(req)
+}
+
+#[cfg(not(test))]
+#[allow(dead_code)]
+fn extract_bearer_key(req: &Request<Body>) -> Option<String> {
+    crate::middleware::extract_client_credential_from_request(req)
 }
 
 // --- Shared server runner ---
@@ -839,7 +559,7 @@ pub async fn run_server_with_listener(
     config: Config,
     extra_routes: Router<Arc<Proxy>>,
     listener: tokio::net::TcpListener,
- ) {
+) {
     let config = Arc::new(config);
     let balancer = Arc::new(WeightedRoundRobin::new(
         config.backends.clone(),
@@ -968,4 +688,31 @@ async fn shutdown_signal() {
     let signal_name = ctrl_c.await;
 
     info!("Shutting down on {}...", signal_name);
+}
+#[cfg(test)]
+mod tests {
+    use super::extract_bearer_key;
+    use axum::http::Request;
+
+    #[test]
+    fn extract_bearer_key_is_compatible_with_existing_behavior() {
+        let header_request = Request::builder()
+            .uri("/openai/v1/chat/completions?api_key=query-key")
+            .header("authorization", "Bearer header-key")
+            .body(axum::body::Body::empty())
+            .expect("header request");
+        assert_eq!(
+            extract_bearer_key(&header_request).as_deref(),
+            Some("header-key")
+        );
+
+        let query_request = Request::builder()
+            .uri("/openai/v1/chat/completions?foo=1&api_key=query-key&bar=2")
+            .body(axum::body::Body::empty())
+            .expect("query request");
+        assert_eq!(
+            extract_bearer_key(&query_request).as_deref(),
+            Some("query-key")
+        );
+    }
 }

@@ -14,7 +14,6 @@ struct Sample {
     tokens: u32,
 }
 
-
 /// record/evict 过程中对 model_totals 的增量更新。
 ///
 /// 设计目标：
@@ -214,12 +213,21 @@ impl MetricsStore {
             }
             let removed_sum = samples.iter().map(|s| s.tok_per_sec).sum::<f64>();
             let removed_count = samples.len();
-            self.apply_model_total_delta(&key.1, ModelTotalDelta::default(), ModelTotalDelta::from_removed(removed_sum, removed_count));
+            self.apply_model_total_delta(
+                &key.1,
+                ModelTotalDelta::default(),
+                ModelTotalDelta::from_removed(removed_sum, removed_count),
+            );
             false
         });
     }
 
-    fn apply_model_total_delta(&self, model: &str, added: ModelTotalDelta, removed: ModelTotalDelta) {
+    fn apply_model_total_delta(
+        &self,
+        model: &str,
+        added: ModelTotalDelta,
+        removed: ModelTotalDelta,
+    ) {
         let delta = ModelTotalDelta {
             added_sum: added.added_sum,
             added_count: added.added_count,

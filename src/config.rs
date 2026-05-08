@@ -126,10 +126,7 @@ impl Config {
         // 构建 auth key 的索引（key -> Vec 下标），用于请求路径的快速查找。
         // 语义保持：仍以 keys 中的条目为准；若存在重复 key，保留第一个（与线性 find() 的行为一致）。
         let mut auth = cfg.auth;
-        auth.key_index = HashMap::with_capacity(auth.keys.len());
-        for (idx, k) in auth.keys.iter().enumerate() {
-            auth.key_index.entry(k.key.clone()).or_insert(idx);
-        }
+        auth.key_index = crate::model_resolution::build_auth_key_index(&auth.keys);
         cfg.auth = auth;
 
         tracing::info!(
@@ -190,7 +187,7 @@ impl Config {
     }
 
     pub fn find_api_key(&self, key: &str) -> Option<&ApiKey> {
-        let idx = *self.auth.key_index.get(key)?;
+        let idx = *crate::model_resolution::api_key_index(self, key)?;
         self.auth.keys.get(idx)
     }
 }

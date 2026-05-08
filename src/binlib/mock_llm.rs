@@ -52,7 +52,11 @@ pub enum MockOutcome {
 }
 
 /// 基于随机样本做纯决策，方便测试边界值行为。
-pub fn decide_outcome(config: &MockConfig, rate_limit_sample: f32, error_sample: f32) -> MockOutcome {
+pub fn decide_outcome(
+    config: &MockConfig,
+    rate_limit_sample: f32,
+    error_sample: f32,
+) -> MockOutcome {
     if rate_limit_sample < config.rate_limit_rate {
         return MockOutcome::RateLimited;
     }
@@ -133,7 +137,9 @@ pub async fn chat_handler(
             if stream {
                 let delay_ms = config.delay_ms;
                 let stream = mock_sse_stream(model, delay_ms);
-                Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+                Sse::new(stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response()
             } else {
                 sleep(Duration::from_millis(config.delay_ms)).await;
                 (StatusCode::OK, Json(build_success_body(&model))).into_response()
@@ -142,7 +148,10 @@ pub async fn chat_handler(
     }
 }
 
-pub fn mock_sse_stream(model: String, delay_ms: u64) -> impl Stream<Item = Result<Event, Infallible>> {
+pub fn mock_sse_stream(
+    model: String,
+    delay_ms: u64,
+) -> impl Stream<Item = Result<Event, Infallible>> {
     let req_id = format!("chatcmpl-{}", uuid_part());
     let created = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -150,7 +159,15 @@ pub fn mock_sse_stream(model: String, delay_ms: u64) -> impl Stream<Item = Resul
         .as_secs();
 
     let chunks = vec![
-        "This", " is", " a", " mock", " response", " for", " streaming", " testing", ".",
+        "This",
+        " is",
+        " a",
+        " mock",
+        " response",
+        " for",
+        " streaming",
+        " testing",
+        ".",
     ];
 
     let events: Vec<Event> = chunks
@@ -231,7 +248,10 @@ mod tests {
             error_rate: 1.0,
             rate_limit_rate: 0.0,
         };
-        assert_eq!(decide_outcome(&config, 0.5, 0.0), MockOutcome::InternalError);
+        assert_eq!(
+            decide_outcome(&config, 0.5, 0.0),
+            MockOutcome::InternalError
+        );
     }
 
     #[test]
@@ -247,13 +267,19 @@ mod tests {
     #[test]
     fn test_extract_request_options_defaults() {
         let body = serde_json::json!({});
-        assert_eq!(extract_request_options(&body), ("unknown".to_string(), false));
+        assert_eq!(
+            extract_request_options(&body),
+            ("unknown".to_string(), false)
+        );
     }
 
     #[test]
     fn test_extract_request_options_reads_model_and_stream() {
         let body = serde_json::json!({"model": "glm-5.1", "stream": true});
-        assert_eq!(extract_request_options(&body), ("glm-5.1".to_string(), true));
+        assert_eq!(
+            extract_request_options(&body),
+            ("glm-5.1".to_string(), true)
+        );
     }
 
     #[test]

@@ -39,7 +39,8 @@ async fn main() {
 
     tracing::info!(
         "Starting unified-proxy on :{}, logging to {}/",
-        config.server.port, log_dir
+        config.server.port,
+        log_dir
     );
     tracing::info!("Loaded config: {}", config_path);
 

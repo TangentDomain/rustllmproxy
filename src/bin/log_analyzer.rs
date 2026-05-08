@@ -13,7 +13,9 @@ fn main() -> Result<()> {
     let output_path = output_path_for(&log_path);
 
     let file = File::open(&log_path)?;
-    let lines: Vec<String> = BufReader::new(file).lines().collect::<std::io::Result<_>>()?;
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .collect::<std::io::Result<_>>()?;
 
     // 保持原实现的语义：解析失败的 timestamp 回退到当前时间
     let stats = log_analyzer::analyze_lines(lines, chrono::Utc::now());

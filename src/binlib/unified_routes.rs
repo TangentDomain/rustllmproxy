@@ -43,9 +43,7 @@ pub fn protocol_routes() -> Router<Arc<Proxy>> {
 pub fn rewrite_prefixed_request(req: &mut Request<Body>, prefix: &str, protocol: &str) {
     let uri = req.uri().to_string();
     let new_path = uri.replacen(prefix, "", 1);
-    *req.uri_mut() = new_path
-        .parse()
-        .expect("valid uri after prefix strip");
+    *req.uri_mut() = new_path.parse().expect("valid uri after prefix strip");
     req.extensions_mut().insert(protocol.to_string());
 }
 
@@ -88,7 +86,10 @@ pub async fn anthropic_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<V
     }))
 }
 
-pub async fn openai_handler(State(proxy): State<Arc<Proxy>>, mut req: Request<Body>) -> Response<Body> {
+pub async fn openai_handler(
+    State(proxy): State<Arc<Proxy>>,
+    mut req: Request<Body>,
+) -> Response<Body> {
     rewrite_prefixed_request(&mut req, "/openai", "openai");
     proxy.handle(req).await
 }

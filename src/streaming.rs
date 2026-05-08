@@ -117,7 +117,8 @@ pub fn instrument_stream(
                                 if sse_data != b"[DONE]" {
                                     saw_effective_chunk = true;
                                     if let Ok(text) = std::str::from_utf8(sse_data) {
-                                        if !in_thinking && text.contains(r#"\"type\":\"thinking\""#) {
+                                        if !in_thinking && text.contains(r#"\"type\":\"thinking\""#)
+                                        {
                                             in_thinking = true;
                                             info!(
                                                 "[{}] [THINKING] Started on {} via {}",
@@ -146,8 +147,8 @@ pub fn instrument_stream(
                                         let check_elapsed = last_speed_check.elapsed();
                                         if check_elapsed >= Duration::from_secs(10) {
                                             let current_token_count = content_text.len();
-                                            let recent_chars =
-                                                current_token_count.saturating_sub(tokens_at_last_check);
+                                            let recent_chars = current_token_count
+                                                .saturating_sub(tokens_at_last_check);
                                             let recent_tps =
                                                 recent_chars as f64 / check_elapsed.as_secs_f64();
                                             if recent_tps < 4.0
@@ -200,7 +201,11 @@ pub fn instrument_stream(
             .unwrap_or(ttfb_ms);
         let streaming_ms = total_ms.saturating_sub(ttft_ms);
         let output_tokens = backend_tokens.unwrap_or_else(|| count_tokens(&content_text));
-        let denom_ms = if streaming_ms < 1000 { total_ms } else { streaming_ms };
+        let denom_ms = if streaming_ms < 1000 {
+            total_ms
+        } else {
+            streaming_ms
+        };
         let tokens_per_sec = if output_tokens > 0 && denom_ms > 0 {
             output_tokens as f64 / (denom_ms as f64 / 1000.0)
         } else {
@@ -261,7 +266,7 @@ fn append_content_text(json: &str, content_text: &mut String) {
         }
         let key_end = i;
         i += 1; // skip closing quote
-        // 跳过空白，确认 ':'
+                // 跳过空白，确认 ':'
         while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
             i += 1;
         }

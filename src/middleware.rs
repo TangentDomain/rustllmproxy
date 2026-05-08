@@ -5,6 +5,33 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// 从请求中提取客户端凭证（当前仅支持：Authorization: Bearer <key> 或 query api_key=<key>）。
+///
+/// 该函数是 auth/rate-limit 边界的显式耦合点：
+/// - 只依赖 HeaderMap/Uri（通过 Request 访问），不携带 Proxy/AppState 等业务状态；
+/// - 行为必须与历史一致（大小写/前缀/空白等均保持原样）；
+/// - 方便在单元测试中直接验证解析行为。
+pub fn extract_client_credential_from_request<B>(
+    request: &axum::http::Request<B>,
+) -> Option<String> {
+    // 优先从 Authorization header 提取
+    if let Some(auth) = request.headers().get("authorization") {
+        if let Ok(v) = auth.to_str() {
+            if let Some(key) = v.strip_prefix("Bearer ") {
+                return Some(key.to_string());
+            }
+        }
+    }
+    // 从 query 参数提取
+    if let Some(query) = request.uri().query() {
+        for pair in query.split('&') {
+            if let Some(val) = pair.strip_prefix("api_key=") {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
 /// 每个key的限流状态
 struct RateLimitEntry {
     count: u32,
@@ -100,7 +127,7 @@ pub async fn auth_middleware(
     }
 
     // 提取 API key
-    let key = extract_api_key(&request);
+    let key = extract_client_credential_from_request(&request);
     let key = match key {
         Some(k) => k,
         None => {
@@ -133,24 +160,73 @@ pub async fn auth_middleware(
     Ok(next.run(request).await)
 }
 
-fn extract_api_key(request: &Request) -> Option<String> {
-    // 优先从 Authorization header 提取
-    if let Some(auth) = request.headers().get("authorization") {
-        if let Ok(v) = auth.to_str() {
-            if let Some(key) = v.strip_prefix("Bearer ") {
-                return Some(key.to_string());
-            }
-        }
+// 兼容旧的私有函数名，避免未来局部回滚/对比时误改调用点。
+#[cfg(test)]
+fn extract_api_key<B>(request: &Request<B>) -> Option<String> {
+    extract_client_credential_from_request(request)
+}
+
+#[cfg(not(test))]
+#[allow(dead_code)]
+fn extract_api_key<B>(request: &Request<B>) -> Option<String> {
+    extract_client_credential_from_request(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_api_key;
+    use axum::http::Request;
+
+    #[test]
+    fn extract_api_key_preserves_existing_bearer_and_query_behavior() {
+        let header_request = Request::builder()
+            .uri("/openai/v1/chat/completions?api_key=query-key")
+            .header("authorization", "Bearer header-key")
+            .body(())
+            .expect("header request");
+        assert_eq!(
+            extract_api_key(&header_request).as_deref(),
+            Some("header-key")
+        );
+
+        let query_request = Request::builder()
+            .uri("/openai/v1/chat/completions?foo=1&api_key=query-key&bar=2")
+            .body(())
+            .expect("query request");
+        assert_eq!(
+            extract_api_key(&query_request).as_deref(),
+            Some("query-key")
+        );
+
+        let lowercase_bearer_request = Request::builder()
+            .uri("/openai/v1/chat/completions?api_key=query-key")
+            .header("authorization", "bearer lower-key")
+            .body(())
+            .expect("lowercase bearer request");
+        assert_eq!(
+            extract_api_key(&lowercase_bearer_request).as_deref(),
+            Some("query-key")
+        );
+
+        let spaced_bearer_request = Request::builder()
+            .uri("/openai/v1/chat/completions")
+            .header("authorization", "Bearer  spaced-key")
+            .body(())
+            .expect("spaced bearer request");
+        assert_eq!(
+            extract_api_key(&spaced_bearer_request).as_deref(),
+            Some(" spaced-key")
+        );
+
+        let empty_query_key_request = Request::builder()
+            .uri("/openai/v1/chat/completions?x=1&api_key=&y=2")
+            .body(())
+            .expect("empty query key request");
+        assert_eq!(
+            extract_api_key(&empty_query_key_request).as_deref(),
+            Some("")
+        );
     }
-    // 从 query 参数提取
-    if let Some(query) = request.uri().query() {
-        for pair in query.split('&') {
-            if let Some(val) = pair.strip_prefix("api_key=") {
-                return Some(val.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// 认证信息，注入到 request extensions
