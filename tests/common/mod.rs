@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use axum::extract::State;
+use axum::response::IntoResponse;
+use axum::routing::get;
 use axum::Router;
 use llmproxy::config::{ApiKey, AuthConfig, Backend, Config, ServerConfig};
 use llmproxy::proxy::{run_server_with_listener, Proxy};
@@ -19,6 +22,7 @@ pub struct TestBackend {
     pub protocol: String,
     pub models: Vec<String>,
     pub api_key: String,
+    pub connect_timeout_secs: u64,
 }
 
 impl TestBackend {
@@ -29,6 +33,7 @@ impl TestBackend {
             protocol: "openai".to_string(),
             models: vec!["mock-model".to_string()],
             api_key: "mock-key".to_string(),
+            connect_timeout_secs: 1,
         }
     }
 
@@ -39,6 +44,7 @@ impl TestBackend {
             protocol: "anthropic".to_string(),
             models: vec!["mock-model".to_string()],
             api_key: "mock-key".to_string(),
+            connect_timeout_secs: 1,
         }
     }
 
@@ -49,6 +55,11 @@ impl TestBackend {
 
     pub fn with_api_key(mut self, api_key: impl Into<String>) -> Self {
         self.api_key = api_key.into();
+        self
+    }
+
+    pub fn with_connect_timeout_secs(mut self, secs: u64) -> Self {
+        self.connect_timeout_secs = secs;
         self
     }
 }
@@ -144,7 +155,7 @@ impl TestConfigBuilder {
                 weight: 1,
                 models: backend.models,
                 timeout_secs: self.timeout_secs,
-                connect_timeout_secs: 1,
+                connect_timeout_secs: backend.connect_timeout_secs,
                 model_mappings: HashMap::new(),
                 protocol: backend.protocol,
                 auth_header: format!("Bearer {}", backend.api_key),
@@ -221,6 +232,15 @@ pub fn protocol_routes() -> Router<Arc<Proxy>> {
     llmproxy::binlib::unified_routes::protocol_routes()
 }
 
+pub fn proxy_introspection_routes() -> Router<Arc<Proxy>> {
+    Router::new()
+        .route(
+            "/test/backend-metrics/{name}",
+            get(test_backend_metric_handler),
+        )
+        .route("/test/model-metrics/{name}", get(test_model_metric_handler))
+}
+
 pub fn openai_chat_body(model: &str, content: &str) -> String {
     serde_json::to_string(&serde_json::json!({
         "model": model,
@@ -236,4 +256,20 @@ pub fn anthropic_messages_body(model: &str, content: &str) -> String {
         "messages": [{"role": "user", "content": content}]
     }))
     .expect("serialize anthropic body")
+}
+
+async fn test_backend_metric_handler(
+    State(proxy): State<Arc<Proxy>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let avg = proxy.backend_avg_tok_per_sec(&name);
+    axum::Json(serde_json::json!({ "backend": name, "avg_tok_per_sec": avg }))
+}
+
+async fn test_model_metric_handler(
+    State(proxy): State<Arc<Proxy>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let avg = proxy.model_avg_tok_per_sec(&name);
+    axum::Json(serde_json::json!({ "model": name, "avg_tok_per_sec": avg }))
 }

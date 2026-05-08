@@ -128,7 +128,7 @@ impl MetricsStore {
         total_ms: u64,
         tokens: u32,
     ) {
-        if tok_per_sec <= 0.0 {
+        if !tok_per_sec.is_finite() || tok_per_sec < 0.0 {
             return;
         }
         let sample = Sample {
@@ -333,5 +333,51 @@ mod tests {
         }
 
         assert!((store.avg_for_model("glm-5.1") - 16.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn zero_tps_is_recorded_and_avg_becomes_zero() {
+        let store =
+            MetricsStore::new("target/test-metrics/zero_tps_is_recorded_and_avg_becomes_zero");
+        store.record("backend-a", "glm-5.1", 0.0, 100, 200, 300, 10);
+        store.record("backend-b", "glm-5.1", 0.0, 100, 200, 300, 10);
+        assert_eq!(store.avg_for_model("glm-5.1"), 0.0);
+    }
+
+    #[test]
+    fn negative_tps_is_skipped_and_unknown_avg_remains_one() {
+        let store = MetricsStore::new(
+            "target/test-metrics/negative_tps_is_skipped_and_unknown_avg_remains_one",
+        );
+        store.record("backend-a", "glm-5.1", -1.0, 100, 200, 300, 10);
+        assert_eq!(store.avg_for_model("glm-5.1"), 1.0);
+    }
+
+    #[test]
+    fn nan_tps_is_skipped_and_unknown_avg_remains_one() {
+        let store =
+            MetricsStore::new("target/test-metrics/nan_tps_is_skipped_and_unknown_avg_remains_one");
+        store.record("backend-a", "glm-5.1", f64::NAN, 100, 200, 300, 10);
+        assert_eq!(store.avg_for_model("glm-5.1"), 1.0);
+    }
+
+    #[test]
+    fn inf_tps_is_skipped_and_unknown_avg_remains_one() {
+        let store =
+            MetricsStore::new("target/test-metrics/inf_tps_is_skipped_and_unknown_avg_remains_one");
+        store.record("backend-a", "glm-5.1", f64::INFINITY, 100, 200, 300, 10);
+        store.record("backend-a", "glm-5.1", f64::NEG_INFINITY, 100, 200, 300, 10);
+        assert_eq!(store.avg_for_model("glm-5.1"), 1.0);
+    }
+
+    #[test]
+    fn model_totals_represents_zero_sum_correctly() {
+        let store =
+            MetricsStore::new("target/test-metrics/model_totals_represents_zero_sum_correctly");
+        store.record("backend-a", "glm-5.1", 10.0, 100, 200, 300, 10);
+        store.record("backend-b", "glm-5.1", 0.0, 100, 200, 300, 10);
+        store.record("backend-a", "glm-4.7", 0.0, 100, 200, 300, 10);
+        assert_eq!(store.avg_for_model("glm-5.1"), 5.0);
+        assert_eq!(store.avg_for_model("glm-4.7"), 0.0);
     }
 }

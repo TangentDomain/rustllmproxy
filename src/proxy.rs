@@ -2,7 +2,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::request_prep::{extract_max_tokens, extract_model_from_json, prepare_request_body};
+use crate::request_prep::{
+    extract_max_tokens, extract_model_from_json, has_negative_max_tokens, prepare_request_body,
+};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
@@ -23,16 +25,19 @@ use crate::balancer::WeightedRoundRobin;
 use crate::config::{Backend, Config};
 use crate::metrics::MetricsStore;
 use crate::middleware::RateLimiter;
+use crate::response_meta::inject_non_stream_response_headers;
 use crate::selection::{choose_weighted_index, WeightFill};
 use crate::streaming::instrument_stream;
 
 /// 转发错误分类，决定后续行为
 enum ForwardError {
     /// 4xx 客户端错误 → 直接返回，不fallback
-    ClientError(StatusCode, String),
+    ClientError(StatusCode, String, String, u64),
     /// 429 Rate Limit → 立即切换下一个key
     RateLimited,
-    /// 5xx/超时/连接失败 → 切换下一个后端
+    /// 4xx provider/client-specific error → fallback but do not penalize backend health
+    RetryableClientStatus(String),
+    /// 5xx/超时/连接失败 → 切换下一个后端并标记不健康
     ServerErr(String),
 }
 
@@ -42,28 +47,40 @@ pub struct Proxy {
     balancer: Arc<WeightedRoundRobin>,
     limiter: Arc<RateLimiter>,
     metrics: Arc<BackendMetrics>,
-    client: Client,
+    /// 按 connect_timeout_secs 分组缓存的 reqwest client（避免热路径重复 build）
+    client_cache: Arc<std::collections::HashMap<u64, Client>>,
     store: Arc<MetricsStore>,
 }
 
 impl Proxy {
     pub fn new(config: Arc<Config>, balancer: Arc<WeightedRoundRobin>) -> Self {
-        let client = Client::builder()
-            .pool_max_idle_per_host(50)
-            .pool_idle_timeout(Duration::from_secs(120))
-            .connect_timeout(Duration::from_secs(3))
-            .tcp_keepalive(Duration::from_secs(60))
-            .tcp_keepalive_interval(Duration::from_secs(15))
-            .tcp_keepalive_retries(3)
-            .tcp_nodelay(true)
-            .build()
-            .expect("failed to build reqwest client");
+        let mut timeouts = std::collections::HashSet::<u64>::new();
+        for b in &config.backends {
+            timeouts.insert(b.connect_timeout_secs);
+        }
+        if timeouts.is_empty() {
+            timeouts.insert(3);
+        }
+        let mut client_cache = std::collections::HashMap::new();
+        for secs in timeouts {
+            let client = Client::builder()
+                .pool_max_idle_per_host(50)
+                .pool_idle_timeout(Duration::from_secs(120))
+                .connect_timeout(Duration::from_secs(secs))
+                .tcp_keepalive(Duration::from_secs(60))
+                .tcp_keepalive_interval(Duration::from_secs(15))
+                .tcp_keepalive_retries(3)
+                .tcp_nodelay(true)
+                .build()
+                .expect("failed to build reqwest client");
+            client_cache.insert(secs, client);
+        }
         let log_dir = config.server.log_dir.clone();
         Self {
             config,
             balancer,
             limiter: Arc::new(RateLimiter::new()),
-            client,
+            client_cache: Arc::new(client_cache),
             metrics: Arc::new(BackendMetrics::new(10)),
             store: Arc::new(MetricsStore::new(&format!("{log_dir}/metrics"))),
         }
@@ -77,9 +94,16 @@ impl Proxy {
         &self.config
     }
 
-    /// 检查后端是否健康（O(1) 查找）
     fn is_healthy(&self, b: &Backend) -> bool {
         self.balancer.is_healthy(&b.name)
+    }
+
+    fn mark_backend_healthy(&self, backend_name: &str) {
+        self.balancer.mark_healthy_by_name(backend_name);
+    }
+
+    fn mark_backend_unhealthy(&self, backend_name: &str) {
+        self.balancer.mark_unhealthy_by_name(backend_name);
     }
 
     /// Main proxy handler: follow fallback chain, route each model to matching backends.
@@ -166,6 +190,13 @@ impl Proxy {
             info!("Model mapping: {original_model} -> {model}");
         }
         let max_tokens = extract_max_tokens(&bytes);
+        if has_negative_max_tokens(&bytes) {
+            info!(
+                "Rejecting request with negative max_tokens: path={path}, protocol={:?}",
+                protocol
+            );
+            return (StatusCode::BAD_REQUEST, "max_tokens must be non-negative").into_response();
+        }
         info!("Request model={model}, path={path}, protocol={:?}, body={body_size}B, max_tokens={max_tokens:?}", protocol);
 
         let chain = self.config.get_fallback_chain(&model);
@@ -213,9 +244,8 @@ impl Proxy {
                 // Prepare body: model patch + backend-specific preprocessing
                 let body_bytes =
                     prepare_request_body(&bytes, &original_model, try_model, &resolved, selected);
-
                 match self
-                    .do_forward(path, &parts.headers, body_bytes, selected)
+                    .do_forward(path, &parts.headers, body_bytes, selected, &request_id)
                     .await
                 {
                     Ok((mut resp, ttfb, is_stream)) => {
@@ -285,13 +315,22 @@ impl Proxy {
                             return resp;
                         }
                     }
-                    Err(ForwardError::ClientError(status, body)) => {
+                    Err(ForwardError::ClientError(status, body, backend_name, ttfb_ms)) => {
                         let total_ms = t_start.elapsed().as_millis() as u64;
                         info!(
                             "Client error from {}: {} - returning directly ({}ms)",
                             selected.name, status, total_ms
                         );
-                        return (status, body).into_response();
+                        let mut resp = (status, body).into_response();
+                        resp.headers_mut()
+                            .insert("x-request-id", request_id.parse().unwrap());
+                        resp.headers_mut()
+                            .insert("x-backend", backend_name.parse().unwrap());
+                        resp.headers_mut()
+                            .insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
+                        resp.headers_mut()
+                            .insert("x-total-ms", total_ms.to_string().parse().unwrap());
+                        return resp;
                     }
                     Err(ForwardError::RateLimited) => {
                         info!(
@@ -300,7 +339,12 @@ impl Proxy {
                         );
                         continue;
                     }
+                    Err(ForwardError::RetryableClientStatus(e)) => {
+                        info!("{} retryable 4xx: {}, trying next", selected.name, e);
+                        continue;
+                    }
                     Err(ForwardError::ServerErr(e)) => {
+                        self.mark_backend_unhealthy(&selected.name);
                         info!("{} server error: {}, trying next", selected.name, e);
                         continue;
                     }
@@ -327,6 +371,11 @@ impl Proxy {
             .into_response();
         resp.headers_mut()
             .insert("x-request-id", request_id.parse().unwrap());
+        resp.headers_mut()
+            .insert("x-backend", "exhausted".parse().unwrap());
+        resp.headers_mut().insert("x-ttfb-ms", "0".parse().unwrap());
+        resp.headers_mut()
+            .insert("x-total-ms", total_ms.to_string().parse().unwrap());
         resp
     }
 
@@ -337,6 +386,7 @@ impl Proxy {
         orig_headers: &HeaderMap,
         body: Bytes,
         backend: &Backend,
+        request_id: &str,
     ) -> Result<(Response<Body>, Duration, bool), ForwardError> {
         // Rewrite /v1/ -> /v4/ 仅对 OpenAI 协议 + bigmodel 域名（coding API）
         // Anthropic 格式保持原始路径
@@ -357,8 +407,17 @@ impl Proxy {
 
         let t_backend = Instant::now();
 
-        let mut req_builder = self
-            .client
+        let connect_timeout_secs = backend.connect_timeout_secs;
+        let client = self
+            .client_cache
+            .get(&connect_timeout_secs)
+            .or_else(|| self.client_cache.values().next())
+            .ok_or_else(|| ForwardError::ServerErr("client cache is empty".to_string()))?;
+
+        let resolved_model =
+            crate::model_resolution::resolved_model(backend, &extract_model_from_json(&body));
+
+        let mut req_builder = client
             .post(&url)
             .timeout(Duration::from_secs(backend.timeout_secs))
             .body(body);
@@ -396,17 +455,31 @@ impl Proxy {
         let code = status.as_u16();
 
         if status.is_success() {
+            self.mark_backend_healthy(&backend.name);
             let ttfb = t_backend.elapsed();
             let is_stream = resp
                 .headers()
                 .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .is_some_and(|v| v.contains("text/event-stream"));
-            Ok((self.stream_response(resp).await, ttfb, is_stream))
+            if is_stream {
+                Ok((self.stream_response(resp).await, ttfb, true))
+            } else {
+                let response = self
+                    .non_stream_response(
+                        resp,
+                        &backend.name,
+                        &resolved_model,
+                        request_id,
+                        t_backend,
+                        ttfb.as_millis() as u64,
+                    )
+                    .await;
+                Ok((response, ttfb, false))
+            }
         } else if code == 429 {
             Err(ForwardError::RateLimited)
         } else if code == 401 {
-            // key 无效，重试也没用，直接返回
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
             warn!("{} auth failed (401): {}", backend.name, body_str);
@@ -414,12 +487,12 @@ impl Proxy {
             Err(ForwardError::ClientError(
                 status_axum,
                 body_str.into_owned(),
+                backend.name.clone(),
+                t_backend.elapsed().as_millis() as u64,
             ))
         } else if (400..500).contains(&code) {
             let body_bytes = resp.bytes().await.unwrap_or_default();
             let body_str = String::from_utf8_lossy(&body_bytes);
-            // 422 Unprocessable Entity: 通常是请求参数校验失败（max_tokens超限、格式错误等）
-            // 换后端大概率一样失败，直接返回避免浪费时间
             if code == 422 {
                 info!(
                     "{} returned 422 (param error), returning directly: {}",
@@ -430,19 +503,19 @@ impl Proxy {
                 return Err(ForwardError::ClientError(
                     status_axum,
                     body_str.into_owned(),
+                    backend.name.clone(),
+                    t_backend.elapsed().as_millis() as u64,
                 ));
             }
-            // 400/403/404/415 等 → 不同 provider 可能行为不同，值得 fallback
             info!(
                 "{} returned {} (4xx), falling back: {}",
                 backend.name, status, body_str
             );
-            Err(ForwardError::ServerErr(format!(
+            Err(ForwardError::RetryableClientStatus(format!(
                 "{} returned {}: {}",
                 backend.name, status, body_str
             )))
         } else {
-            // 5xx 服务端错误 → 切换下一个后端
             Err(ForwardError::ServerErr(format!(
                 "{} returned {}",
                 backend.name, status
@@ -465,9 +538,135 @@ impl Proxy {
         builder.body(body).unwrap()
     }
 
+    async fn non_stream_response(
+        &self,
+        resp: reqwest::Response,
+        backend_name: &str,
+        resolved_model: &str,
+        request_id: &str,
+        started_at: Instant,
+        ttfb_ms: u64,
+    ) -> Response<Body> {
+        let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+        let content_type = resp.headers().get(header::CONTENT_TYPE).cloned();
+        let content_encoding = resp.headers().get(header::CONTENT_ENCODING).cloned();
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+        let total_ms = started_at.elapsed().as_millis() as u64;
+
+        if let Some(tokens) = extract_completion_tokens_from_json(&body_bytes)
+            .or_else(|| estimate_tokens_from_body_json(&body_bytes))
+        {
+            let tok_per_sec = if tokens > 0 && total_ms > 0 {
+                tokens as f64 / (total_ms as f64 / 1000.0)
+            } else {
+                0.0
+            };
+            self.metrics.record(backend_name, tok_per_sec);
+            self.store.record(
+                backend_name,
+                resolved_model,
+                tok_per_sec,
+                ttfb_ms,
+                ttfb_ms,
+                total_ms,
+                tokens,
+            );
+        }
+
+        let mut resp = Response::new(Body::from(body_bytes));
+        *resp.status_mut() = status;
+        if let Some(ct) = content_type {
+            resp.headers_mut().insert(header::CONTENT_TYPE, ct);
+        }
+        if let Some(ce) = content_encoding {
+            resp.headers_mut().insert(header::CONTENT_ENCODING, ce);
+        }
+        inject_non_stream_response_headers(&mut resp, request_id, backend_name, ttfb_ms, total_ms);
+        resp
+    }
+
     pub fn limiter(&self) -> &Arc<RateLimiter> {
         &self.limiter
     }
+
+    pub fn backend_avg_tok_per_sec(&self, backend_name: &str) -> f64 {
+        self.metrics.avg(backend_name)
+    }
+
+    pub fn model_avg_tok_per_sec(&self, model: &str) -> f64 {
+        self.store.avg_for_model(model)
+    }
+}
+
+fn extract_completion_tokens_from_json(body: &[u8]) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("usage")?
+        .get("completion_tokens")?
+        .as_u64()
+        .map(|v| v as u32)
+}
+
+fn estimate_tokens_from_body_json(body: &[u8]) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let mut text = String::new();
+    collect_text_fields(&value, &mut text);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(count_tokens(trimmed))
+    }
+}
+
+fn collect_text_fields(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => out.push_str(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_text_fields(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(content) = map.get("content") {
+                collect_content_value(content, out);
+            }
+            if let Some(message) = map.get("message") {
+                collect_text_fields(message, out);
+            }
+            if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                out.push_str(text);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_content_value(value: &serde_json::Value, out: &mut String) {
+    match value {
+        serde_json::Value::String(s) => out.push_str(s),
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(text) = item.get("text").and_then(serde_json::Value::as_str) {
+                    out.push_str(text);
+                } else {
+                    collect_content_value(item, out);
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            if let Some(text) = map.get("text").and_then(serde_json::Value::as_str) {
+                out.push_str(text);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn count_tokens(text: &str) -> u32 {
+    static BPE: std::sync::OnceLock<tiktoken_rs::CoreBPE> = std::sync::OnceLock::new();
+    let bpe = BPE.get_or_init(|| tiktoken_rs::cl100k_base().expect("tiktoken init failed"));
+    bpe.encode_ordinary(text).len() as u32
 }
 
 /// Auth middleware adapted for Proxy state.

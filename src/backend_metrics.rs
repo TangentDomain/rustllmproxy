@@ -18,7 +18,7 @@ impl BackendMetrics {
 
     /// Record a tok/s sample for a backend.
     pub fn record(&self, backend: &str, tps: f64) {
-        if tps <= 0.0 {
+        if !tps.is_finite() || tps < 0.0 {
             return;
         }
         let mut map = self.tok_per_sec.write();
@@ -36,5 +36,49 @@ impl BackendMetrics {
             .filter(|v| !v.is_empty())
             .map(|v| v.iter().sum::<f64>() / v.len() as f64)
             .unwrap_or(1.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zero_tps_is_recorded_and_avg_becomes_zero() {
+        let metrics = BackendMetrics::new(5);
+        metrics.record("backend-a", 0.0);
+        metrics.record("backend-a", 0.0);
+        assert_eq!(metrics.avg("backend-a"), 0.0);
+    }
+
+    #[test]
+    fn negative_tps_is_rejected() {
+        let metrics = BackendMetrics::new(5);
+        metrics.record("backend-a", -1.0);
+        assert_eq!(metrics.avg("backend-a"), 1.0);
+    }
+
+    #[test]
+    fn nan_tps_is_rejected() {
+        let metrics = BackendMetrics::new(5);
+        metrics.record("backend-a", f64::NAN);
+        assert_eq!(metrics.avg("backend-a"), 1.0);
+    }
+
+    #[test]
+    fn inf_tps_is_rejected() {
+        let metrics = BackendMetrics::new(5);
+        metrics.record("backend-a", f64::INFINITY);
+        metrics.record("backend-a", f64::NEG_INFINITY);
+        assert_eq!(metrics.avg("backend-a"), 1.0);
+    }
+
+    #[test]
+    fn mixed_valid_and_zero_tps_avg_works() {
+        let metrics = BackendMetrics::new(5);
+        metrics.record("backend-a", 10.0);
+        metrics.record("backend-a", 0.0);
+        metrics.record("backend-a", 20.0);
+        assert_eq!(metrics.avg("backend-a"), 10.0);
     }
 }

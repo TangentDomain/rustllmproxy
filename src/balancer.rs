@@ -164,6 +164,20 @@ impl WeightedRoundRobin {
         }
     }
 
+    pub fn mark_healthy_by_name(&self, backend_name: &str) {
+        if let Some(&idx) = self.name_index.get(backend_name) {
+            let state = &self.backends[idx];
+            self.mark_healthy(state);
+        }
+    }
+
+    pub fn mark_unhealthy_by_name(&self, backend_name: &str) {
+        if let Some(&idx) = self.name_index.get(backend_name) {
+            let state = &self.backends[idx];
+            self.mark_unhealthy(state);
+        }
+    }
+
     pub fn all_backends(&self) -> Vec<Arc<BackendState>> {
         self.backends.clone()
     }
