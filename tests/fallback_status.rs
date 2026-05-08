@@ -7,19 +7,28 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
-use common::{openai_chat_body, spawn_mock, spawn_proxy, TestBackend, TestConfigBuilder, TEST_API_KEY};
+use common::{
+    openai_chat_body, spawn_mock, spawn_proxy, TestBackend, TestConfigBuilder, TEST_API_KEY,
+};
 use reqwest::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn falls_back_on_429_and_5xx_to_next_backend() {
-    for first_status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::INTERNAL_SERVER_ERROR] {
+    for first_status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::INTERNAL_SERVER_ERROR,
+    ] {
         let first_hits = Arc::new(AtomicUsize::new(0));
         let second_hits = Arc::new(AtomicUsize::new(0));
-        let (first_addr, first_handle) = spawn_status_mock(first_status, Arc::clone(&first_hits)).await;
-        let (second_addr, second_handle) = spawn_success_mock(Arc::clone(&second_hits), "fallback-ok").await;
+        let (first_addr, first_handle) =
+            spawn_status_mock(first_status, Arc::clone(&first_hits)).await;
+        let (second_addr, second_handle) =
+            spawn_success_mock(Arc::clone(&second_hits), "fallback-ok").await;
         let config = TestConfigBuilder::new()
             .backend(TestBackend::openai("first-backend", first_addr).with_models(&["mock-model"]))
-            .backend(TestBackend::openai("second-backend", second_addr).with_models(&["fallback-model"]))
+            .backend(
+                TestBackend::openai("second-backend", second_addr).with_models(&["fallback-model"]),
+            )
             .fallback_chain("mock-model", &["fallback-model"])
             .build();
         let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
@@ -58,11 +67,15 @@ async fn returns_401_and_422_directly_without_fallback() {
     for direct_status in [StatusCode::UNAUTHORIZED, StatusCode::UNPROCESSABLE_ENTITY] {
         let first_hits = Arc::new(AtomicUsize::new(0));
         let second_hits = Arc::new(AtomicUsize::new(0));
-        let (first_addr, first_handle) = spawn_status_mock(direct_status, Arc::clone(&first_hits)).await;
-        let (second_addr, second_handle) = spawn_success_mock(Arc::clone(&second_hits), "should-not-hit").await;
+        let (first_addr, first_handle) =
+            spawn_status_mock(direct_status, Arc::clone(&first_hits)).await;
+        let (second_addr, second_handle) =
+            spawn_success_mock(Arc::clone(&second_hits), "should-not-hit").await;
         let config = TestConfigBuilder::new()
             .backend(TestBackend::openai("first-backend", first_addr).with_models(&["mock-model"]))
-            .backend(TestBackend::openai("second-backend", second_addr).with_models(&["fallback-model"]))
+            .backend(
+                TestBackend::openai("second-backend", second_addr).with_models(&["fallback-model"]),
+            )
             .fallback_chain("mock-model", &["fallback-model"])
             .build();
         let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
@@ -91,11 +104,15 @@ async fn returns_401_and_422_directly_without_fallback() {
 async fn falls_back_on_provider_specific_4xx_but_reports_503_when_exhausted() {
     let first_hits = Arc::new(AtomicUsize::new(0));
     let second_hits = Arc::new(AtomicUsize::new(0));
-    let (first_addr, first_handle) = spawn_status_mock(StatusCode::BAD_REQUEST, Arc::clone(&first_hits)).await;
-    let (second_addr, second_handle) = spawn_status_mock(StatusCode::FORBIDDEN, Arc::clone(&second_hits)).await;
+    let (first_addr, first_handle) =
+        spawn_status_mock(StatusCode::BAD_REQUEST, Arc::clone(&first_hits)).await;
+    let (second_addr, second_handle) =
+        spawn_status_mock(StatusCode::FORBIDDEN, Arc::clone(&second_hits)).await;
     let config = TestConfigBuilder::new()
         .backend(TestBackend::openai("first-backend", first_addr).with_models(&["mock-model"]))
-        .backend(TestBackend::openai("second-backend", second_addr).with_models(&["fallback-model"]))
+        .backend(
+            TestBackend::openai("second-backend", second_addr).with_models(&["fallback-model"]),
+        )
         .fallback_chain("mock-model", &["fallback-model"])
         .build();
     let (proxy_addr, proxy_handle) = spawn_proxy(config).await;

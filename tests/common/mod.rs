@@ -187,7 +187,9 @@ impl Default for TestConfigBuilder {
 }
 
 pub async fn bind_random_listener() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.expect("bind listener")
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener")
 }
 
 pub async fn spawn_mock(app: Router) -> (SocketAddr, JoinHandle<()>) {

@@ -37,7 +37,8 @@ async fn proxy_handles_concurrent_mock_requests_without_shell_tools() {
     let proxy_addr = proxy_listener.local_addr().expect("proxy addr");
     let config = make_config(mock_addr);
     let proxy_handle = tokio::spawn(async move {
-        let extra_routes = Router::new().route("/openai/v1/{*path}", post(openai_passthrough_handler));
+        let extra_routes =
+            Router::new().route("/openai/v1/{*path}", post(openai_passthrough_handler));
         run_server_with_listener(config, extra_routes, proxy_listener).await;
     });
 
@@ -170,5 +171,7 @@ fn make_config(mock_addr: SocketAddr) -> Config {
 }
 
 async fn bind_random_listener() -> TcpListener {
-    TcpListener::bind("127.0.0.1:0").await.expect("bind listener")
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener")
 }

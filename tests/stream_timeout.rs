@@ -17,10 +17,8 @@ use common::{spawn_mock, spawn_proxy_with_routes, TestBackend, TestConfigBuilder
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_idle_timeout_triggers_without_effective_chunks() {
-    let (mock_addr, mock_handle) = spawn_mock(
-        Router::new().route("/v1/chat/completions", post(mock_chat_completions)),
-    )
-    .await;
+    let (mock_addr, mock_handle) =
+        spawn_mock(Router::new().route("/v1/chat/completions", post(mock_chat_completions))).await;
 
     let config = TestConfigBuilder::new()
         .timeout_secs(3)
@@ -66,7 +64,10 @@ async fn stream_idle_timeout_triggers_without_effective_chunks() {
     })
     .await;
 
-    assert!(result.is_ok(), "stream did not terminate within timeout window");
+    assert!(
+        result.is_ok(),
+        "stream did not terminate within timeout window"
+    );
     let inner = result.unwrap();
     assert!(inner.is_err(), "expected stream to end with timeout error");
 
@@ -97,4 +98,3 @@ async fn mock_chat_completions(
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
-

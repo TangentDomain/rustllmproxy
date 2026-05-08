@@ -104,7 +104,9 @@ async fn disabled_auth_bypasses_api_key_check_and_forwards() {
     mock_handle.abort();
 }
 
-async fn spawn_counting_mock(hits: Arc<AtomicUsize>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+async fn spawn_counting_mock(
+    hits: Arc<AtomicUsize>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let app = Router::new()
         .route("/v1/chat/completions", post(counting_openai_handler))
         .with_state(hits);

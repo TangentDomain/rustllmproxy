@@ -6,17 +6,17 @@ use std::time::Duration;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::post;
 use axum::Router;
-use common::{openai_chat_body, spawn_mock, spawn_proxy, TestBackend, TestConfigBuilder, TEST_API_KEY};
+use common::{
+    openai_chat_body, spawn_mock, spawn_proxy, TestBackend, TestConfigBuilder, TEST_API_KEY,
+};
 use futures::StreamExt;
 use reqwest::Client;
 use tokio::time::{sleep, timeout};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn normal_openai_stream_completes_and_preserves_streaming_headers() {
-    let (mock_addr, mock_handle) = spawn_mock(
-        Router::new().route("/v1/chat/completions", post(normal_stream_handler)),
-    )
-    .await;
+    let (mock_addr, mock_handle) =
+        spawn_mock(Router::new().route("/v1/chat/completions", post(normal_stream_handler))).await;
     let config = TestConfigBuilder::new()
         .backend(TestBackend::openai("stream-backend", mock_addr))
         .build();
@@ -24,9 +24,24 @@ async fn normal_openai_stream_completes_and_preserves_streaming_headers() {
 
     let resp = send_stream_request(proxy_addr, "mock-model").await;
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    assert_eq!(resp.headers().get("x-backend").and_then(|v| v.to_str().ok()), Some("stream-backend"));
-    assert_eq!(resp.headers().get("x-accel-buffering").and_then(|v| v.to_str().ok()), Some("no"));
-    assert_eq!(resp.headers().get("cache-control").and_then(|v| v.to_str().ok()), Some("no-cache"));
+    assert_eq!(
+        resp.headers()
+            .get("x-backend")
+            .and_then(|v| v.to_str().ok()),
+        Some("stream-backend")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-accel-buffering")
+            .and_then(|v| v.to_str().ok()),
+        Some("no")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-cache")
+    );
     assert!(resp.headers().get("x-request-id").is_some());
 
     let body = resp.text().await.expect("stream body");
@@ -39,10 +54,9 @@ async fn normal_openai_stream_completes_and_preserves_streaming_headers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn first_chunk_timeout_terminates_stream_before_any_sse_data() {
-    let (mock_addr, mock_handle) = spawn_mock(
-        Router::new().route("/v1/chat/completions", post(first_chunk_delayed_handler)),
-    )
-    .await;
+    let (mock_addr, mock_handle) =
+        spawn_mock(Router::new().route("/v1/chat/completions", post(first_chunk_delayed_handler)))
+            .await;
     let config = TestConfigBuilder::new()
         .timeout_secs(5)
         .stream_first_chunk_timeout_secs(1)
@@ -61,10 +75,9 @@ async fn first_chunk_timeout_terminates_stream_before_any_sse_data() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn total_stream_timeout_terminates_even_when_effective_chunks_keep_arriving() {
-    let (mock_addr, mock_handle) = spawn_mock(
-        Router::new().route("/v1/chat/completions", post(slow_never_done_handler)),
-    )
-    .await;
+    let (mock_addr, mock_handle) =
+        spawn_mock(Router::new().route("/v1/chat/completions", post(slow_never_done_handler)))
+            .await;
     let config = TestConfigBuilder::new()
         .timeout_secs(1)
         .stream_first_chunk_timeout_secs(1)
@@ -80,7 +93,6 @@ async fn total_stream_timeout_terminates_even_when_effective_chunks_keep_arrivin
     proxy_handle.abort();
     mock_handle.abort();
 }
-
 
 async fn send_stream_request(proxy_addr: std::net::SocketAddr, model: &str) -> reqwest::Response {
     let client = Client::new();
