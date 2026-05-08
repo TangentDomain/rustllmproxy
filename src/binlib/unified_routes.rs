@@ -51,7 +51,7 @@ pub fn rewrite_prefixed_request(req: &mut Request<Body>, prefix: &str, protocol:
 pub async fn openai_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<Value> {
     let models: Vec<Value> = proxy
         .config()
-        .all_models()
+        .models_for_protocol("openai")
         .iter()
         .map(|m| {
             serde_json::json!({
@@ -71,7 +71,7 @@ pub async fn openai_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<Valu
 pub async fn anthropic_models_handler(State(proxy): State<Arc<Proxy>>) -> Json<Value> {
     let models: Vec<Value> = proxy
         .config()
-        .all_models()
+        .models_for_protocol("anthropic")
         .iter()
         .map(|m| {
             serde_json::json!({

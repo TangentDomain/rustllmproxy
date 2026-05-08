@@ -116,6 +116,10 @@ async fn model_list_routes_return_protocol_specific_shapes() {
         .backend(
             TestBackend::openai("openai-backend", mock_addr).with_models(&["model-a", "model-b"]),
         )
+        .backend(
+            TestBackend::anthropic("anthropic-backend", mock_addr)
+                .with_models(&["model-c", "model-d"]),
+        )
         .build();
     let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
     let client = Client::new();
@@ -149,6 +153,102 @@ async fn model_list_routes_return_protocol_specific_shapes() {
             .len()
             >= 2
     );
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn openai_models_handler_filters_by_protocol() {
+    let (mock_addr, mock_handle) =
+        spawn_capture_mock("/unused", Arc::new(Mutex::new(Vec::new()))).await;
+    let config = TestConfigBuilder::new()
+        .backend(TestBackend::openai("openai-backend", mock_addr).with_models(&["glm-5.1"]))
+        .backend(
+            TestBackend::anthropic("anthropic-backend", mock_addr).with_models(&["claude-model"]),
+        )
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    let openai = client
+        .get(format!("http://{proxy_addr}/openai/v1/models"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .send()
+        .await
+        .expect("openai models");
+    assert_eq!(openai.status(), StatusCode::OK);
+    let openai_text = openai.text().await.expect("openai models body");
+    let openai_json: serde_json::Value = serde_json::from_str(&openai_text).expect("openai json");
+    // 只应该有 openai 后端的模型
+    let openai_model_ids: Vec<&str> = openai_json["data"]
+        .as_array()
+        .expect("openai data")
+        .iter()
+        .map(|v| v["id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(openai_model_ids.contains(&"glm-5.1"));
+    assert!(!openai_model_ids.contains(&"claude-model"));
+
+    let anthropic = client
+        .get(format!("http://{proxy_addr}/anthropic/v1/models"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .send()
+        .await
+        .expect("anthropic models");
+    assert_eq!(anthropic.status(), StatusCode::OK);
+    let anthropic_text = anthropic.text().await.expect("anthropic models body");
+    let anthropic_json: serde_json::Value =
+        serde_json::from_str(&anthropic_text).expect("anthropic json");
+    // 只应该有 anthropic 后端的模型
+    let anthropic_model_ids: Vec<&str> = anthropic_json["models"]
+        .as_array()
+        .expect("anthropic models")
+        .iter()
+        .map(|v| v["id"].as_str().unwrap_or_default())
+        .collect();
+    assert!(anthropic_model_ids.contains(&"claude-model"));
+    assert!(!anthropic_model_ids.contains(&"glm-5.1"));
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn models_handler_dedups_duplicate_models() {
+    let (mock_addr, mock_handle) =
+        spawn_capture_mock("/unused", Arc::new(Mutex::new(Vec::new()))).await;
+    // 两个 openai 后端都有相同的模型
+    let config = TestConfigBuilder::new()
+        .backend(
+            TestBackend::openai("openai-backend-1", mock_addr).with_models(&["glm-5.1", "glm-4.7"]),
+        )
+        .backend(
+            TestBackend::openai("openai-backend-2", mock_addr).with_models(&["glm-5.1", "glm-4.6"]),
+        )
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    let openai = client
+        .get(format!("http://{proxy_addr}/openai/v1/models"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .send()
+        .await
+        .expect("openai models");
+    assert_eq!(openai.status(), StatusCode::OK);
+    let openai_text = openai.text().await.expect("openai models body");
+    let openai_json: serde_json::Value = serde_json::from_str(&openai_text).expect("openai json");
+    let model_ids: Vec<&str> = openai_json["data"]
+        .as_array()
+        .expect("openai data")
+        .iter()
+        .map(|v| v["id"].as_str().unwrap_or_default())
+        .collect();
+    // 去重后应该只有 3 个模型（glm-5.1, glm-4.7, glm-4.6）
+    assert_eq!(model_ids.len(), 3);
+    // 第一个后端的模型应该在前
+    assert_eq!(model_ids[0], "glm-5.1");
 
     proxy_handle.abort();
     mock_handle.abort();

@@ -144,6 +144,23 @@ impl Config {
             .collect()
     }
 
+    /// 获取指定协议的后端模型列表（稳定顺序、去重）
+    pub fn models_for_protocol(&self, protocol: &str) -> Vec<String> {
+        use std::collections::HashSet;
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for b in &self.backends {
+            if b.protocol == protocol {
+                for m in &b.models {
+                    if seen.insert(m.clone()) {
+                        result.push(m.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+
     /// 获取模型的fallback链：先查具体模型，再查default（以请求模型为首）
     pub fn get_fallback_chain(&self, model: &str) -> Vec<String> {
         // 有专门配置的fallback链
@@ -229,6 +246,22 @@ mod tests {
             connect_timeout_secs: 5,
             model_mappings: HashMap::new(),
             protocol: "openai".to_string(),
+            auth_header: format!("Bearer key-{name}"),
+            strip_params: vec![],
+        }
+    }
+
+    fn make_backend_with_protocol(name: &str, models: &[&str], protocol: &str) -> Backend {
+        Backend {
+            name: name.to_string(),
+            url: format!("https://{name}.com"),
+            api_key: format!("key-{name}"),
+            weight: 10,
+            models: models.iter().map(|s| s.to_string()).collect(),
+            timeout_secs: 30,
+            connect_timeout_secs: 5,
+            model_mappings: HashMap::new(),
+            protocol: protocol.to_string(),
             auth_header: format!("Bearer key-{name}"),
             strip_params: vec![],
         }
@@ -705,5 +738,79 @@ mod tests {
         // 当前实现: 3个后端加权随机
         // 如果都返回 429，会重试第一个 3次 ❌
         // 期望: 应该轮询所有3个后端，每个只试1次 ✅
+    }
+
+    // ─── models_for_protocol Tests ──────────────────────────────
+
+    #[test]
+    fn test_models_for_protocol_openai_only() {
+        let cfg = make_config(
+            HashMap::new(),
+            vec![
+                make_backend_with_protocol("zhipu", &["glm-5.1", "glm-4.7"], "openai"),
+                make_backend_with_protocol("minimax", &["MiniMax-M2.7"], "anthropic"),
+            ],
+        );
+        let openai_models = cfg.models_for_protocol("openai");
+        assert_eq!(openai_models, vec!["glm-5.1", "glm-4.7"]);
+
+        let anthropic_models = cfg.models_for_protocol("anthropic");
+        assert_eq!(anthropic_models, vec!["MiniMax-M2.7"]);
+    }
+
+    #[test]
+    fn test_models_for_protocol_dedup() {
+        let cfg = make_config(
+            HashMap::new(),
+            vec![
+                make_backend_with_protocol("zhipu-1", &["glm-5.1", "glm-4.7"], "openai"),
+                make_backend_with_protocol("zhipu-2", &["glm-5.1", "glm-4.6"], "openai"),
+            ],
+        );
+        let models = cfg.models_for_protocol("openai");
+        // 稳定顺序，第一个后端的模型在前，去重
+        assert_eq!(models, vec!["glm-5.1", "glm-4.7", "glm-4.6"]);
+    }
+
+    #[test]
+    fn test_models_for_protocol_empty_for_unknown() {
+        let cfg = make_config(
+            HashMap::new(),
+            vec![make_backend_with_protocol("zhipu", &["glm-5.1"], "openai")],
+        );
+        let models = cfg.models_for_protocol("anthropic");
+        assert!(models.is_empty());
+    }
+
+    #[test]
+    fn test_models_for_protocol_mixed_backends() {
+        let cfg = make_config(
+            HashMap::new(),
+            vec![
+                make_backend_with_protocol("zhipu-openai", &["glm-5.1", "glm-4.7"], "openai"),
+                make_backend_with_protocol("zhipu-anthropic", &["glm-5.1", "glm-4.7"], "anthropic"),
+                make_backend_with_protocol("minimax", &["MiniMax-M2.7"], "anthropic"),
+            ],
+        );
+        let openai = cfg.models_for_protocol("openai");
+        assert_eq!(openai, vec!["glm-5.1", "glm-4.7"]);
+
+        let anthropic = cfg.models_for_protocol("anthropic");
+        assert_eq!(anthropic, vec!["glm-5.1", "glm-4.7", "MiniMax-M2.7"]);
+    }
+
+    #[test]
+    fn test_models_for_protocol_stable_order() {
+        let cfg = make_config(
+            HashMap::new(),
+            vec![
+                make_backend_with_protocol("b-openai", &["model-b"], "openai"),
+                make_backend_with_protocol("a-openai", &["model-a"], "openai"),
+                make_backend_with_protocol("c-openai", &["model-c"], "openai"),
+            ],
+        );
+        let models = cfg.models_for_protocol("openai");
+        // 稳定顺序：按 backends 中的定义顺序
+        assert_eq!(models, vec!["model-b", "model-a", "model-c"]);
     }
 }
