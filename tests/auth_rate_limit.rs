@@ -116,6 +116,36 @@ async fn query_api_key_authenticates_and_rate_limit_blocks_before_forwarding() {
     proxy_handle.abort();
     mock_handle.abort();
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn backends_route_stays_responsive_under_repeated_authenticated_requests() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let (mock_addr, mock_handle) = spawn_counting_mock(Arc::clone(&hits)).await;
+    let config = TestConfigBuilder::new()
+        .rate_limit(10_000)
+        .backend(TestBackend::openai("mock-backend", mock_addr))
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+    let url = format!("http://{proxy_addr}/backends");
+
+    for _ in 0..128 {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            client
+                .get(&url)
+                .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+                .send(),
+        )
+        .await
+        .expect("backends request should not stall")
+        .expect("backends request");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
 
 #[test]
 fn shared_credential_extraction_preserves_existing_bearer_and_query_behavior() {

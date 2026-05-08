@@ -99,17 +99,19 @@ impl RateLimiter {
         const STALE_SECS: u64 = 120;
         let target = self.cleanup_budget.max(1);
         let mut scanned = 0usize;
-        // DashMap::iter() 的遍历顺序不保证稳定；这里仅用于渐进式清理。
+        let mut expired_keys = Vec::new();
+        // 先只收集过期 key，避免在 DashMap 迭代期间直接 remove() 放大锁竞争。
         for entry in self.entries.iter() {
             scanned += 1;
             if scanned > target {
                 break;
             }
-            // 仅在条目确实过期时尝试 remove，避免额外写锁竞争。
             if now.duration_since(entry.value().window_start).as_secs() >= STALE_SECS {
-                let k = entry.key().clone();
-                self.entries.remove(&k);
+                expired_keys.push(entry.key().clone());
             }
+        }
+        for key in expired_keys {
+            self.entries.remove(&key);
         }
         self.cleanup_cursor
             .fetch_add(scanned as u64, Ordering::Relaxed);
@@ -174,8 +176,9 @@ fn extract_api_key<B>(request: &Request<B>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_api_key;
+    use super::{extract_api_key, RateLimitEntry, RateLimiter};
     use axum::http::Request;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn extract_api_key_preserves_existing_bearer_and_query_behavior() {
@@ -227,8 +230,39 @@ mod tests {
             Some("")
         );
     }
-}
+    #[test]
+    fn cleanup_some_removes_expired_entries_after_iteration() {
+        let limiter = RateLimiter::new();
+        let stale_start = Instant::now() - Duration::from_secs(121);
+        for i in 0..8 {
+            limiter.entries.insert(
+                format!("expired-{i}"),
+                RateLimitEntry {
+                    count: 1,
+                    window_start: stale_start,
+                },
+            );
+        }
 
+        assert!(limiter.check("fresh-key", 10));
+
+        for i in 0..8 {
+            assert!(!limiter.entries.contains_key(&format!("expired-{i}")));
+        }
+        assert!(limiter.entries.contains_key("fresh-key"));
+    }
+
+    #[test]
+    fn cleanup_some_keeps_rate_limit_check_fast_and_correct() {
+        let limiter = RateLimiter::new();
+        for i in 0..128 {
+            assert!(limiter.check(&format!("key-{i}"), 2));
+        }
+        for i in 0..128 {
+            assert!(limiter.check(&format!("key-{i}"), 2));
+        }
+    }
+}
 /// 认证信息，注入到 request extensions
 #[derive(Clone)]
 pub struct AuthInfo {
