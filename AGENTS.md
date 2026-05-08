@@ -37,7 +37,7 @@
 - BigModel OpenAI backend 会把转发路径中的 `/v1/` 改写为 `/v4/`；Anthropic 不改这个路径。
 - `prepare_request_body` 可能按 backend 修改 body：模型替换、`strip_params`、`zhipu-anthropic` JSON sanitize、`minimax-anthropic*` 的 `max_completion_tokens` → `max_tokens`。
 - 错误策略：`401` 和 `422` 直接返回；`429`、`5xx`、以及除 `401/422` 外的 `4xx` 会尝试下一个 backend / fallback model；全部耗尽返回 `503` JSON。
-- `Backend.connect_timeout_secs` 可在配置里写，但当前 `Proxy::new` 的 reqwest client connect timeout 是硬编码 `3s`；不要误以为该字段已驱动 client connect timeout。
+- `Backend.connect_timeout_secs` 会用于构建并选择按超时时间缓存的 `reqwest::Client`；只有没有任何 backend 时才会退回到默认 `3s` client。
 - `WeightedRoundRobin::start_health_check` 当前只是记录“健康检查已禁用”，后端健康主要由请求失败标记和 60s 被动恢复控制。
 
 ## Streaming 与指标
@@ -61,3 +61,31 @@
 - 文档和解释性注释默认中文；API 名、变量名、协议名保留英文。
 - Bugfix 保持最小改动，不要顺手重构 fallback、streaming、auth 或 balancer 热路径。
 - 不要用 `as any`、`@ts-ignore` 等类型压制习惯迁移到本仓库；Rust 侧也不要用无依据的 `unwrap` 扩大 panic 面，除非现有测试/启动代码已明确这样做。
+
+## 闭环验证方法论
+
+本项目采用闭环验证思想：不只验证最终响应，还要验证中间决策轨迹。对于同一请求与同一 mock 后端序列，期望产生一致的路由、fallback、health、metadata 决策。
+
+### 核心公理
+- 相同请求 + 相同 mock 后端响应序列，应产生相同的决策轨迹。
+- 失败时优先定位 first divergent attempt，而不是只看最终 status/body。
+- 核心验证优先使用 Rust integration tests + in-process mock backend，不依赖真实 API，不消耗真实 token。
+- baseline 是代理语义公理，不是真实 provider 当前行为。
+
+### 分层验证
+- J1：纯函数 / 结构层。验证请求解析、配置、模型映射、token 校验等不依赖网络的逻辑。
+- J2：代理行为层。验证 fallback、backend health、状态码语义、response metadata。
+- J3：协议入口层。验证 OpenAI / Anthropic 路由边界和协议改写。
+- J4：运行态层。验证 dev binary、mock 配置、健康检查和本地启动。
+
+### 建议的诊断输出
+- 记录 first divergent attempt、期望 backend、实际 backend、期望 status、实际 status。
+- 记录是否触发 health penalty、是否 fallback、是否注入 proxy metadata headers。
+- 对比应输出结构化差异，不要只给 `FAIL`。
+
+### 反模式
+- ❌ 只验证最终响应而忽略 fallback 中间步骤。
+- ❌ 假设 backend 选择顺序稳定。
+- ❌ 用真实 token 作为回归测试依赖。
+- ❌ 用 Bash / Python / curl 脚本作为核心单元或集成测试依赖。
+- ❌ 在没有确认语义变化是预期的情况下自动更新 baseline。
