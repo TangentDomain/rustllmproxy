@@ -380,4 +380,29 @@ mod tests {
         assert_eq!(store.avg_for_model("glm-5.1"), 5.0);
         assert_eq!(store.avg_for_model("glm-4.7"), 0.0);
     }
+
+    #[test]
+    fn flush_writes_sanitized_metrics_file_with_recent_window() {
+        let dir = "target/test-metrics/flush_writes_sanitized_metrics_file_with_recent_window";
+        let _ = std::fs::remove_dir_all(dir);
+        let store = MetricsStore::new(dir);
+        for i in 0..105 {
+            store.record("backend/a", "glm:5.1", i as f64, 10, 20, 30, 40);
+        }
+
+        store.flush();
+
+        let path = std::path::Path::new(dir).join("backend_a").join("glm_5.1.json");
+        let json = std::fs::read_to_string(path).expect("metrics file");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("metrics json");
+        assert_eq!(value["total_requests"], 105);
+        assert_eq!(value["recent"].as_array().unwrap().len(), 100);
+        assert_eq!(value["min_tok_per_sec"], 0.0);
+        assert_eq!(value["max_tok_per_sec"], 104.0);
+    }
+
+    #[test]
+    fn sanitize_filename_replaces_unsafe_characters() {
+        assert_eq!(sanitize_filename("a/b:c d"), "a_b_c_d");
+    }
 }
