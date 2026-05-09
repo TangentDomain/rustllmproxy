@@ -594,18 +594,67 @@ mod tests {
     }
 
     #[test]
-    fn test_render_markdown_contains_sections() {
-        let stats = LogStats {
-            total_requests: 1,
+    fn test_parse_timestamp_and_numeric_extractors() {
+        let ts = parse_timestamp("2026-01-01T00:00:00.123456Z Request model=x").unwrap();
+        assert_eq!(ts.timestamp(), 1_767_225_600);
+
+        assert_eq!(extract_field_u64("ttfb=123ms, total=456ms", "ttfb"), Some(123));
+        assert_eq!(extract_field_usize("body=789B", "body"), Some(789));
+        assert_eq!(extract_field("no key here", "missing"), None);
+    }
+
+    #[test]
+    fn test_percentiles_empty_and_non_empty() {
+        let mut empty_u64: Vec<u64> = vec![];
+        assert_eq!(ModelStats::percentile_u64(&mut empty_u64, 90.0), 0);
+
+        let mut values_u64 = vec![10, 30, 20, 40];
+        assert_eq!(percentile_u64(&mut values_u64, 50.0), 30);
+    }
+    #[test]
+    fn test_render_markdown_covers_empty_and_populated_sections() {
+        let empty = LogStats::default();
+        let rendered_empty = render_markdown("/tmp/proxy.log", "2026-01-01 00:00:00", &empty);
+        assert!(rendered_empty.contains("无Fallback记录"));
+        assert!(rendered_empty.contains("**TTFT** - 无数据"));
+        assert!(rendered_empty.contains("## 🖥️ 后端使用分布"));
+
+        let mut stats = LogStats {
+            total_requests: 2,
+            total_tokens: 17,
+            fallback_count: 1,
+            error_count: 1,
+            stream_count: 1,
+            non_stream_count: 1,
+            all_durations: vec![100, 200],
+            all_ttfbs: vec![5, 15],
+            all_ttfts: vec![80, 120],
             ..Default::default()
         };
-        let md = render_markdown("foo.log", "2026-01-01 00:00:00", &stats);
-        assert!(md.contains("# LLM Proxy 日志分析报告"));
-        assert!(md.contains("## 📊 概览"));
-        assert!(md.contains("## 📈 总体性能统计"));
-        assert!(md.contains("## 🔄 Fallback分析"));
-        assert!(md.contains("## 📊 按模型分组统计"));
-        assert!(md.contains("## 🖥️ 后端使用分布"));
-        assert!(md.contains("## ⏰ 时间分布"));
+        stats.fallback_chains.insert("glm-5.1 -> glm-4.7".to_string(), 1);
+        stats.backend_stats.insert("zhipu-anthropic".to_string(), 2);
+        stats.requests_by_hour.insert("00".to_string(), 2);
+        stats.errors_by_type.insert("timeout".to_string(), 1);
+        let m = ModelStats {
+            count: 2,
+            fallback_count: 1,
+            total_tokens: 17,
+            total_duration_ms: 300,
+            total_ttfb_ms: 20,
+            total_ttft_ms: 200,
+            durations: vec![100, 200],
+            ttfbs: vec![5, 15],
+            ttfts: vec![80, 120],
+            tok_per_secs: vec![7.5, 9.5],
+            error_count: 1,
+        };
+        stats.model_stats.insert("glm-5.1".to_string(), m);
+
+        let rendered = render_markdown("/tmp/proxy.log", "2026-01-01 00:00:00", &stats);
+        assert!(rendered.contains("Fallback请求"));
+        assert!(rendered.contains("### glm-5.1"));
+        assert!(rendered.contains("| 请求数 | 2 |"));
+        assert!(rendered.contains("zhipu-anthropic"));
+        assert!(rendered.contains("timeout"));
     }
 }

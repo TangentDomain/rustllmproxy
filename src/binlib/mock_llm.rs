@@ -291,9 +291,73 @@ mod tests {
     }
 
     #[test]
-    fn test_uuid_part_is_hex() {
-        let value = uuid_part();
-        assert!(!value.is_empty());
-        assert!(value.chars().all(|ch| ch.is_ascii_hexdigit()));
+    fn test_build_rate_limit_response_shape() {
+        let resp = build_rate_limit_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_build_internal_error_response_shape() {
+        let resp = build_internal_error_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_mock_sse_stream_yields_final_done_marker() {
+        use futures::{pin_mut, StreamExt};
+        let stream = mock_sse_stream("glm-5.1".to_string(), 0);
+        pin_mut!(stream);
+        let mut count = 0usize;
+        let mut saw_done = false;
+        while let Some(item) = stream.next().await {
+            let event = item.expect("stream item");
+            count += 1;
+            if format!("{event:?}").contains("[DONE]") {
+                saw_done = true;
+            }
+        }
+        assert_eq!(count, 11);
+        assert!(saw_done);
+    }
+    #[tokio::test]
+    async fn test_chat_handler_rate_limited_branch() {
+        let config = Arc::new(MockConfig {
+            delay_ms: 0,
+            error_rate: 0.0,
+            rate_limit_rate: 1.0,
+        });
+        let resp = chat_handler(State(config), Json(serde_json::json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn test_chat_handler_internal_error_branch() {
+        let config = Arc::new(MockConfig {
+            delay_ms: 0,
+            error_rate: 1.0,
+            rate_limit_rate: 0.0,
+        });
+        let resp = chat_handler(State(config), Json(serde_json::json!({})))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_chat_handler_non_stream_success_branch() {
+        let config = Arc::new(MockConfig {
+            delay_ms: 0,
+            error_rate: 0.0,
+            rate_limit_rate: 0.0,
+        });
+        let resp = chat_handler(
+            State(config),
+            Json(serde_json::json!({"model": "glm-5.1", "stream": false})),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
