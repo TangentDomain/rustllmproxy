@@ -214,6 +214,7 @@ fn sanitize_json_bytes(bytes: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     // ─── extract_model_from_json Tests ──────────────────────────
 
@@ -296,5 +297,44 @@ mod tests {
     fn test_has_negative_max_tokens_detects_top_level_negative_value() {
         let body = br#"{"model":"glm-5.1","max_tokens":-1,"messages":[]}"#;
         assert!(has_negative_max_tokens(body));
+    }
+    /// 构建测试用 Backend
+    fn backend(name: &str, protocol: &str, strip_params: Vec<&str>) -> Backend {
+        Backend {
+            name: name.to_string(),
+            url: "https://example.com".to_string(),
+            api_key: "key".to_string(),
+            weight: 1,
+            models: vec!["glm-5.1".to_string()],
+            timeout_secs: 30,
+            connect_timeout_secs: 5,
+            model_mappings: std::collections::HashMap::new(),
+            protocol: protocol.to_string(),
+            auth_header: String::new(),
+            strip_params: strip_params.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    #[test]
+    fn test_prepare_request_body_paths() {
+        let no_change = Bytes::from_static(br#"{"model":"glm-5.1","messages":[]}"#);
+        let backend_openai = backend("openai-backend", "openai", vec![]);
+        let out = prepare_request_body(&no_change, "glm-5.1", "glm-5.1", "glm-5.1", &backend_openai);
+        assert_eq!(out, no_change);
+
+        let patched = Bytes::from_static(br#"{"model":"glm-4.7","max_completion_tokens":2048,"thinking":true,"messages":[]}"#);
+        let backend_minimax = backend("minimax-anthropic", "anthropic", vec!["thinking"]);
+        let out = prepare_request_body(&patched, "glm-4.7", "glm-5.1", "glm-5.1", &backend_minimax);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value.get("model").and_then(|v| v.as_str()), Some("glm-5.1"));
+        assert_eq!(value.get("max_tokens").and_then(|v| v.as_u64()), Some(2048));
+        assert!(value.get("max_completion_tokens").is_none());
+        assert!(value.get("thinking").is_none());
+
+        let messy = Bytes::from_static(br#"{"model":"glm-5.1","messages":[],}"#);
+        let backend_zhipu = backend("zhipu-anthropic", "anthropic", vec![]);
+        let out = prepare_request_body(&messy, "glm-5.1", "glm-5.1", "glm-5.1", &backend_zhipu);
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value.get("model").and_then(|v| v.as_str()), Some("glm-5.1"));
+        assert!(value.get("messages").is_some());
     }
 }
