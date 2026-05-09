@@ -151,6 +151,7 @@ fn make_config(mock_addr: SocketAddr) -> Config {
             stream_idle_timeout_secs: 10,
             stream_first_chunk_timeout_secs: 10,
             fallback_timeout_secs: 10,
+            recovery_cooldown_secs: 60,
         },
         r#type: "openai".to_string(),
         auth: AuthConfig {

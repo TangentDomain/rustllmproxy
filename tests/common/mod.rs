@@ -75,6 +75,7 @@ pub struct TestConfigBuilder {
     backends: Vec<TestBackend>,
     fallback: HashMap<String, Vec<String>>,
     model_mapping: HashMap<String, Vec<String>>,
+    recovery_cooldown_secs: u64,
 }
 
 impl TestConfigBuilder {
@@ -90,6 +91,7 @@ impl TestConfigBuilder {
             backends: Vec::new(),
             fallback: HashMap::new(),
             model_mapping: HashMap::new(),
+            recovery_cooldown_secs: 60,
         }
     }
 
@@ -144,6 +146,10 @@ impl TestConfigBuilder {
         self
     }
 
+    pub fn recovery_cooldown_secs(mut self, secs: u64) -> Self {
+        self.recovery_cooldown_secs = secs;
+        self
+    }
     pub fn build(self) -> Config {
         let backends = self
             .backends
@@ -171,6 +177,7 @@ impl TestConfigBuilder {
                 stream_idle_timeout_secs: self.stream_idle_timeout_secs,
                 stream_first_chunk_timeout_secs: self.stream_first_chunk_timeout_secs,
                 fallback_timeout_secs: self.fallback_timeout_secs,
+                recovery_cooldown_secs: self.recovery_cooldown_secs,
             },
             r#type: "openai".to_string(),
             auth: AuthConfig {

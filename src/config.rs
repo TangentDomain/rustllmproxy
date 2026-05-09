@@ -31,6 +31,9 @@ pub struct ServerConfig {
     /// fallback 链总超时（秒），超过则中止 fallback
     #[serde(default = "default_fallback_timeout")]
     pub fallback_timeout_secs: u64,
+    /// 熔断后进入 half-open 试探前的冷却时间（秒）
+    #[serde(default = "default_recovery_cooldown_secs")]
+    pub recovery_cooldown_secs: u64,
 }
 
 fn default_log_dir() -> String {
@@ -45,7 +48,9 @@ fn default_stream_first_chunk_timeout() -> u64 {
 fn default_fallback_timeout() -> u64 {
     300
 }
-
+fn default_recovery_cooldown_secs() -> u64 {
+    60
+}
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
     pub enabled: bool,
@@ -300,6 +305,7 @@ mod tests {
                 stream_idle_timeout_secs: 120,
                 stream_first_chunk_timeout_secs: 60,
                 fallback_timeout_secs: 300,
+                recovery_cooldown_secs: 60,
             },
             r#type: "openai".to_string(),
             auth: AuthConfig {
@@ -341,6 +347,7 @@ mod tests {
                 stream_idle_timeout_secs: 120,
                 stream_first_chunk_timeout_secs: 60,
                 fallback_timeout_secs: 300,
+                recovery_cooldown_secs: 60,
             },
             r#type: "openai".to_string(),
             auth,

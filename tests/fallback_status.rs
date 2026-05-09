@@ -431,6 +431,88 @@ async fn non_stream_success_records_metrics_without_corrupting_response() {
     backend_handle.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn circuit_breaker_enters_half_open_after_cooldown_and_recovers_on_success() {
+    let broken_hits = Arc::new(AtomicUsize::new(0));
+    let healthy_hits = Arc::new(AtomicUsize::new(0));
+    let (broken_addr, broken_handle) =
+        spawn_recovery_mock(Arc::clone(&broken_hits), "recovered").await;
+    let (healthy_addr, healthy_handle) =
+        spawn_success_mock(Arc::clone(&healthy_hits), "healthy").await;
+    let config = TestConfigBuilder::new()
+        .recovery_cooldown_secs(0)
+        .backend(
+            TestBackend::openai("broken-backend", broken_addr)
+                .with_models(&["broken-model"])
+                .with_connect_timeout_secs(1),
+        )
+        .backend(
+            TestBackend::openai("healthy-backend", healthy_addr)
+                .with_models(&["healthy-model"])
+                .with_connect_timeout_secs(1),
+        )
+        .fallback_chain("broken-model", &["healthy-model"])
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy_with_routes(
+        config,
+        common::protocol_routes().merge(proxy_introspection_routes()),
+    )
+    .await;
+    let client = Client::new();
+
+    for _ in 0..3 {
+        let resp = client
+            .post(format!("http://{proxy_addr}/openai/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+            .header("Content-Type", "application/json")
+            .body(openai_chat_body("broken-model", "trip circuit"))
+            .send()
+            .await
+            .expect("trip circuit request");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    let opened = read_backend_entry(&client, proxy_addr, "broken-backend").await;
+    assert_eq!(opened["healthy"], false);
+    assert_eq!(opened["ready"], true);
+    assert_eq!(opened["circuit_state"], "open");
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/openai/v1/chat/completions"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .header("Content-Type", "application/json")
+        .body(openai_chat_body("broken-model", "half-open probe"))
+        .send()
+        .await
+        .expect("half-open recovery request");
+    let backend = resp
+        .headers()
+        .get("x-backend")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let status = resp.status();
+    let body = resp.text().await.expect("recovered body");
+    assert_eq!(status, StatusCode::OK, "body={body}");
+    assert_eq!(backend.as_deref(), Some("broken-backend"));
+    assert!(body.contains("recovered"));
+
+    let recovered = read_backend_entry(&client, proxy_addr, "broken-backend").await;
+    assert_eq!(recovered["healthy"], true);
+    assert_eq!(recovered["ready"], true);
+    assert_eq!(recovered["circuit_state"], "closed");
+
+    let resp = client
+        .get(format!("http://{proxy_addr}/ready"))
+        .send()
+        .await
+        .expect("ready request");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    proxy_handle.abort();
+    broken_handle.abort();
+    healthy_handle.abort();
+}
+
 async fn spawn_status_mock(
     status: StatusCode,
     hits: Arc<AtomicUsize>,
@@ -451,6 +533,15 @@ async fn spawn_success_mock(
     spawn_mock(app).await
 }
 
+async fn spawn_recovery_mock(
+    hits: Arc<AtomicUsize>,
+    content: &'static str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let app = Router::new()
+        .route("/v1/chat/completions", post(recovery_handler))
+        .with_state((hits, content));
+    spawn_mock(app).await
+}
 async fn spawn_success_with_usage_mock(
     hits: Arc<AtomicUsize>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
@@ -525,4 +616,53 @@ async fn success_with_usage_handler(
             }
         })),
     )
+}
+
+async fn recovery_handler(
+    State((hits, content)): State<(Arc<AtomicUsize>, &'static str)>,
+    Json(payload): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    assert_eq!(payload["model"], "broken-model");
+    let attempt = hits.fetch_add(1, Ordering::SeqCst) + 1;
+    if attempt <= 3 {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(serde_json::json!({"error": "temporary"})),
+        );
+    }
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "id": "recovery-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }]
+        })),
+    )
+}
+
+async fn read_backend_entry(
+    client: &Client,
+    proxy_addr: std::net::SocketAddr,
+    backend_name: &str,
+) -> serde_json::Value {
+    let resp = client
+        .get(format!("http://{proxy_addr}/backends"))
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .send()
+        .await
+        .expect("backends request");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.expect("backends body");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("backends json");
+    json["backends"]
+        .as_array()
+        .expect("backends array")
+        .iter()
+        .find(|backend| backend["name"] == backend_name)
+        .expect("backend entry")
+        .clone()
 }

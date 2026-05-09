@@ -254,6 +254,47 @@ async fn models_handler_dedups_duplicate_models() {
     mock_handle.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ready_endpoint_is_public_and_reports_not_ready_when_all_backends_open() {
+    let hits = Arc::new(Mutex::new(0usize));
+    let (mock_addr, mock_handle) =
+        spawn_always_status_mock(StatusCode::INTERNAL_SERVER_ERROR, Arc::clone(&hits)).await;
+    let config = TestConfigBuilder::new()
+        .recovery_cooldown_secs(60)
+        .backend(TestBackend::openai("failing-backend", mock_addr).with_models(&["mock-model"]))
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    for _ in 0..3 {
+        let resp = client
+            .post(format!("http://{proxy_addr}/openai/v1/chat/completions"))
+            .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+            .header("Content-Type", "application/json")
+            .body(openai_chat_body("mock-model", "trip readiness"))
+            .send()
+            .await
+            .expect("trip readiness request");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    let ready = client
+        .get(format!("http://{proxy_addr}/ready"))
+        .send()
+        .await
+        .expect("ready request");
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let ready_text = ready.text().await.expect("ready body");
+    let ready_json: serde_json::Value = serde_json::from_str(&ready_text).expect("ready json");
+    assert_eq!(ready_json["status"], "not_ready");
+    assert_eq!(ready_json["ready_backends"], 0);
+    assert_eq!(ready_json["total_backends"], 1);
+    assert_eq!(ready_json["backends"][0]["circuit_state"], "open");
+
+    proxy_handle.abort();
+    mock_handle.abort();
+}
+
 async fn spawn_capture_mock(
     route: &'static str,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
@@ -300,4 +341,23 @@ async fn capture_handler(
             "finish_reason": "stop"
         }]
     }))
+}
+
+async fn spawn_always_status_mock(
+    status: StatusCode,
+    hits: Arc<Mutex<usize>>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let app = Router::new()
+        .route("/v1/chat/completions", post(always_status_handler))
+        .with_state((status, hits));
+    spawn_mock(app).await
+}
+
+async fn always_status_handler(
+    State((status, hits)): State<(StatusCode, Arc<Mutex<usize>>)>,
+    Json(_payload): Json<serde_json::Value>,
+) -> (StatusCode, String) {
+    let mut hits = hits.lock().expect("hits lock");
+    *hits += 1;
+    (status, format!("mock status {}", status.as_u16()))
 }

@@ -21,7 +21,15 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, info_span, warn};
 
 use crate::backend_metrics::BackendMetrics;
-use crate::balancer::WeightedRoundRobin;
+use crate::balancer::{BackendStatus, WeightedRoundRobin};
+
+pub struct ReadinessSnapshot {
+    pub status: &'static str,
+    pub ready_backends: usize,
+    pub total_backends: usize,
+    pub recovery_cooldown_ms: u64,
+    pub backends: Vec<BackendStatus>,
+}
 use crate::config::{Backend, Config};
 use crate::metrics::MetricsStore;
 use crate::middleware::RateLimiter;
@@ -92,6 +100,17 @@ impl Proxy {
 
     pub fn config(&self) -> &Arc<Config> {
         &self.config
+    }
+    pub fn readiness_snapshot(&self) -> ReadinessSnapshot {
+        let backends = self.balancer.backend_statuses();
+        let ready_backends = backends.iter().filter(|backend| backend.ready).count();
+        ReadinessSnapshot {
+            status: if ready_backends > 0 { "ready" } else { "not_ready" },
+            ready_backends,
+            total_backends: backends.len(),
+            recovery_cooldown_ms: self.balancer.recovery_cooldown().as_millis() as u64,
+            backends,
+        }
     }
 
     fn is_healthy(&self, b: &Backend) -> bool {
@@ -289,12 +308,28 @@ impl Proxy {
                             resp.headers_mut()
                                 .insert("x-ttfb-ms", ttfb_ms.to_string().parse().unwrap());
                             let stream_task_request_id = request_id.clone();
+                            let stream_task_backend_name = selected.name.clone();
+                            let stream_task_balancer = self.balancer.clone();
                             tokio::spawn(async move {
-                                if let Err(err) = done_rx.await {
-                                    error!(
-                                        "[{}] stream instrumentation task failed: {}",
-                                        stream_task_request_id, err
-                                    );
+                                match done_rx.await {
+                                    Ok(completion) if completion.timed_out => {
+                                        warn!(
+                                            "[{}] stream timed out; marking backend unhealthy",
+                                            stream_task_request_id
+                                        );
+                                        stream_task_balancer
+                                            .mark_unhealthy_by_name(&stream_task_backend_name);
+                                    }
+                                    Ok(_) => {
+                                        stream_task_balancer
+                                            .mark_healthy_by_name(&stream_task_backend_name);
+                                    }
+                                    Err(err) => {
+                                        error!(
+                                            "[{}] stream instrumentation task failed: {}",
+                                            stream_task_request_id, err
+                                        );
+                                    }
                                 }
                             });
                             return resp;
@@ -455,7 +490,6 @@ impl Proxy {
         let code = status.as_u16();
 
         if status.is_success() {
-            self.mark_backend_healthy(&backend.name);
             let ttfb = t_backend.elapsed();
             let is_stream = resp
                 .headers()
@@ -465,6 +499,7 @@ impl Proxy {
             if is_stream {
                 Ok((self.stream_response(resp).await, ttfb, true))
             } else {
+                self.mark_backend_healthy(&backend.name);
                 let response = self
                     .non_stream_response(
                         resp,
@@ -760,10 +795,11 @@ pub async fn run_server_with_listener(
     listener: tokio::net::TcpListener,
 ) {
     let config = Arc::new(config);
-    let balancer = Arc::new(WeightedRoundRobin::new(
+    let balancer = Arc::new(WeightedRoundRobin::with_recovery_cooldown(
         config.backends.clone(),
         config.retry,
         Duration::from_millis(config.retry_delay_ms),
+        Duration::from_secs(config.server.recovery_cooldown_secs),
     ));
     let proxy = Arc::new(Proxy::new(config.clone(), balancer.clone()));
     let addr = listener.local_addr().expect("failed to read listener addr");
@@ -790,9 +826,10 @@ pub async fn run_server_with_listener(
 fn build_app(proxy: Arc<Proxy>, extra_routes: Router<Arc<Proxy>>) -> Router {
     // 公共路由（不需要认证）
     let public_routes = Router::new().route(
-        "/health",
-        get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
-    );
+            "/health",
+            get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+        )
+        .route("/ready", get(readiness_handler));
 
     // 受保护路由（需要认证）
     let protected_routes = Router::new()
@@ -849,18 +886,55 @@ fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
 async fn backends_handler(State(proxy): State<Arc<Proxy>>) -> axum::Json<serde_json::Value> {
     let backends: Vec<serde_json::Value> = proxy
         .balancer()
-        .all_backends()
-        .iter()
-        .map(|b| {
+        .backend_statuses()
+        .into_iter()
+        .map(|backend| {
             serde_json::json!({
-                "name": b.backend.name,
-                "url": b.backend.url,
-                "healthy": b.healthy.load(std::sync::atomic::Ordering::Relaxed),
-                "fail_count": b.fail_count.load(std::sync::atomic::Ordering::Relaxed),
+                "name": backend.name,
+                "url": backend.url,
+                "healthy": backend.healthy,
+                "ready": backend.ready,
+                "fail_count": backend.fail_count,
+                "circuit_state": backend.circuit_state.as_str(),
+                "opened_since_ms": backend.opened_since_ms,
             })
         })
         .collect();
     axum::Json(serde_json::json!({"backends": backends}))
+}
+
+async fn readiness_handler(State(proxy): State<Arc<Proxy>>) -> impl IntoResponse {
+    let snapshot = proxy.readiness_snapshot();
+    let status = if snapshot.ready_backends > 0 {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let backends: Vec<serde_json::Value> = snapshot
+        .backends
+        .into_iter()
+        .map(|backend| {
+            serde_json::json!({
+                "name": backend.name,
+                "url": backend.url,
+                "healthy": backend.healthy,
+                "ready": backend.ready,
+                "fail_count": backend.fail_count,
+                "circuit_state": backend.circuit_state.as_str(),
+                "opened_since_ms": backend.opened_since_ms,
+            })
+        })
+        .collect();
+    (
+        status,
+        axum::Json(serde_json::json!({
+            "status": snapshot.status,
+            "ready_backends": snapshot.ready_backends,
+            "total_backends": snapshot.total_backends,
+            "recovery_cooldown_ms": snapshot.recovery_cooldown_ms,
+            "backends": backends,
+        })),
+    )
 }
 
 async fn shutdown_signal() {
@@ -890,8 +964,15 @@ async fn shutdown_signal() {
 }
 #[cfg(test)]
 mod tests {
-    use super::extract_bearer_key;
-    use axum::http::Request;
+    use super::{backends_handler, estimate_tokens_from_body_json, extract_bearer_key, extract_completion_tokens_from_json, readiness_handler, Proxy};
+    use crate::balancer::WeightedRoundRobin;
+    use crate::config::{AuthConfig, Config, ServerConfig};
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
+    use axum::response::IntoResponse;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn extract_bearer_key_is_compatible_with_existing_behavior() {
@@ -913,5 +994,81 @@ mod tests {
             extract_bearer_key(&query_request).as_deref(),
             Some("query-key")
         );
+    }
+
+    fn empty_proxy() -> Arc<Proxy> {
+        let config = Arc::new(Config {
+            server: ServerConfig {
+                port: 0,
+                timeout_secs: 1,
+                log_dir: "target/test-proxy-empty".to_string(),
+                stream_idle_timeout_secs: 1,
+                stream_first_chunk_timeout_secs: 1,
+                fallback_timeout_secs: 1,
+                recovery_cooldown_secs: 1,
+            },
+            r#type: "test".to_string(),
+            auth: AuthConfig {
+                enabled: false,
+                keys: Vec::new(),
+                key_index: HashMap::new(),
+            },
+            backends: Vec::new(),
+            retry: 0,
+            retry_delay_ms: 0,
+            fallback: HashMap::new(),
+            model_mapping: HashMap::new(),
+        });
+        let balancer = Arc::new(WeightedRoundRobin::new(
+            Vec::new(),
+            0,
+            Duration::from_millis(0),
+        ));
+        Arc::new(Proxy::new(config, balancer))
+    }
+
+    #[test]
+    fn proxy_with_no_backends_reports_not_ready_and_has_default_client_cache() {
+        let proxy = empty_proxy();
+        let snapshot = proxy.readiness_snapshot();
+
+        assert_eq!(snapshot.status, "not_ready");
+        assert_eq!(snapshot.ready_backends, 0);
+        assert_eq!(snapshot.total_backends, 0);
+        assert_eq!(snapshot.recovery_cooldown_ms, 60_000);
+        assert!(proxy.client_cache.contains_key(&3));
+    }
+
+    #[tokio::test]
+    async fn backends_handler_returns_empty_backend_list_without_consuming_state() {
+        let response = backends_handler(State(empty_proxy())).await;
+
+        assert_eq!(response.0["backends"].as_array().expect("backends array").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn readiness_handler_returns_service_unavailable_when_no_backends_are_ready() {
+        let response = readiness_handler(State(empty_proxy())).await.into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn proxy_token_helpers_extract_usage_and_estimate_nested_content() {
+        let usage_body = br#"{"usage":{"completion_tokens":17}}"#;
+        assert_eq!(extract_completion_tokens_from_json(usage_body), Some(17));
+
+        let nested_body = br#"{
+            "message":{"content":[{"text":"hello"},{"content":{"text":" world"}}]},
+            "text":"!"
+        }"#;
+        assert!(estimate_tokens_from_body_json(nested_body).is_some_and(|tokens| tokens > 0));
+    }
+
+    #[test]
+    fn proxy_token_estimator_rejects_invalid_or_empty_json() {
+        assert_eq!(extract_completion_tokens_from_json(b"not json"), None);
+        assert_eq!(estimate_tokens_from_body_json(br#"{"message":{"content":"   "}}"#), None);
+        assert_eq!(estimate_tokens_from_body_json(b"not json"), None);
     }
 }

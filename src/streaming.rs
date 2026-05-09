@@ -9,6 +9,11 @@ use tracing::{info, warn};
 use crate::backend_metrics::BackendMetrics;
 use crate::metrics::MetricsStore;
 
+#[derive(Debug)]
+pub struct StreamCompletion {
+    pub timed_out: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn instrument_stream(
     body: Body,
@@ -23,7 +28,7 @@ pub fn instrument_stream(
     metrics: Arc<BackendMetrics>,
     store: Arc<MetricsStore>,
     request_id: String,
-) -> (Body, JoinHandle<()>) {
+) -> (Body, JoinHandle<StreamCompletion>) {
     let rid = request_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
@@ -89,7 +94,7 @@ pub fn instrument_stream(
                             )))
                             .await;
                     }
-                    break;
+                    return StreamCompletion { timed_out: true };
                 }
             };
 
@@ -97,7 +102,7 @@ pub fn instrument_stream(
                 Ok(f) => f,
                 Err(e) => {
                     let _ = tx.send(Err(std::io::Error::other(e))).await;
-                    break;
+                    return StreamCompletion { timed_out: false };
                 }
             };
 
@@ -224,6 +229,7 @@ pub fn instrument_stream(
         );
 
         info!("[{}] Done: {} -> {} via {} | total={}ms, ttfb={}ms, ttft={}ms, tokens={output_tokens}, {tokens_per_sec:.1}tok/s", rid, model, resolved, backend_name, total_ms, ttfb_ms, ttft_ms);
+        StreamCompletion { timed_out: false }
     });
 
     let new_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
@@ -407,6 +413,9 @@ fn count_tokens(text: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
+    use tokio::time::{sleep, Duration as TokioDuration};
 
     #[test]
     fn append_content_text_decodes_standard_json_escapes() {
@@ -429,5 +438,159 @@ mod tests {
     fn extract_completion_tokens_parses_number() {
         let json = r#"{"usage":{"completion_tokens":123,"prompt_tokens":9}}"#;
         assert_eq!(extract_completion_tokens(json), Some(123));
+    }
+
+    #[test]
+    fn append_content_text_ignores_nested_suffix_content_key() {
+        let mut out = String::new();
+        append_content_text(r#"{"foo_content":"skip","content":"keep"}"#, &mut out);
+        assert_eq!(out, "keep");
+    }
+
+    #[test]
+    fn extract_completion_tokens_rejects_missing_and_non_numeric_values() {
+        assert_eq!(extract_completion_tokens(r#"{"usage":{"prompt_tokens":9}}"#), None);
+        assert_eq!(extract_completion_tokens(r#"{"completion_tokens":"12"}"#), None);
+        assert_eq!(extract_completion_tokens(r#"{"completion_tokens" 42}"#), None);
+        assert_eq!(extract_completion_tokens(r#"{"completion_tokens": 42, "x": 1}"#), Some(42));
+    }
+
+    #[test]
+    fn count_tokens_handles_mixed_language_text() {
+        assert!(count_tokens("hello 世界").gt(&0));
+    }
+
+    #[test]
+    fn append_content_text_handles_malformed_and_non_string_fields() {
+        let mut out = String::new();
+        append_content_text(r#"{"unterminated"#, &mut out);
+        append_content_text(r#"{"escaped\"key":"ignored","content":"ok"}"#, &mut out);
+        append_content_text(r#"{"content": 1, "thinking":"done"}"#, &mut out);
+        append_content_text(r#"{"content":"raw\qfallback"}"#, &mut out);
+
+        assert_eq!(out, "okdoneraw\\qfallback");
+    }
+
+    #[tokio::test]
+    async fn instrument_stream_records_metrics_on_successful_completion() {
+        let metrics = Arc::new(BackendMetrics::new(5));
+        let dir = "target/test-metrics/streaming_success_records_metrics";
+        let _ = std::fs::remove_dir_all(dir);
+        let store = Arc::new(MetricsStore::new(dir));
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            ));
+            sleep(TokioDuration::from_millis(10)).await;
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"usage\":{\"completion_tokens\":7}}\n\n",
+            ));
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+        };
+        let body = Body::from_stream(stream);
+
+        let (instrumented, done) = instrument_stream(
+            body,
+            "mock-model".to_string(),
+            "resolved-model".to_string(),
+            "backend-a".to_string(),
+            Duration::from_millis(2),
+            Instant::now(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Arc::clone(&metrics),
+            Arc::clone(&store),
+            "rid-success".to_string(),
+        );
+
+        let bytes = instrumented
+            .collect()
+            .await
+            .expect("instrumented body")
+            .to_bytes();
+        let completion = done.await.expect("stream task");
+
+        assert!(!completion.timed_out);
+        assert!(std::str::from_utf8(&bytes).expect("utf8 body").contains("hello"));
+        assert!(metrics.avg("backend-a") > 0.0);
+        assert!(store.avg_for_model("resolved-model") > 0.0);
+    }
+
+    #[tokio::test]
+    async fn instrument_stream_first_chunk_timeout_returns_timed_out_completion() {
+        let stream = async_stream::stream! {
+            sleep(TokioDuration::from_millis(80)).await;
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: {\"content\":\"late\"}\n\n"));
+        };
+        let body = Body::from_stream(stream);
+        let metrics = Arc::new(BackendMetrics::new(5));
+        let store = Arc::new(MetricsStore::new(
+            "target/test-metrics/streaming_first_chunk_timeout",
+        ));
+
+        let (instrumented, done) = instrument_stream(
+            body,
+            "mock-model".to_string(),
+            "resolved-model".to_string(),
+            "backend-a".to_string(),
+            Duration::from_millis(1),
+            Instant::now(),
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+            metrics,
+            store,
+            "rid-timeout".to_string(),
+        );
+
+        let body_result = instrumented.collect().await;
+        let completion = done.await.expect("stream task");
+
+        assert!(completion.timed_out);
+        assert!(body_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn instrument_stream_idle_timeout_ignores_role_only_chunks() {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"first\"}}]}\n\n",
+            ));
+            sleep(TokioDuration::from_millis(15)).await;
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            ));
+            sleep(TokioDuration::from_millis(70)).await;
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\n",
+            ));
+        };
+        let body = Body::from_stream(stream);
+        let metrics = Arc::new(BackendMetrics::new(5));
+        let store = Arc::new(MetricsStore::new(
+            "target/test-metrics/streaming_idle_timeout_ignores_role_only",
+        ));
+
+        let (instrumented, done) = instrument_stream(
+            body,
+            "mock-model".to_string(),
+            "resolved-model".to_string(),
+            "backend-a".to_string(),
+            Duration::from_millis(1),
+            Instant::now(),
+            Duration::from_millis(40),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            metrics,
+            store,
+            "rid-idle-timeout".to_string(),
+        );
+
+        let body_result = instrumented.collect().await;
+        let completion = done.await.expect("stream task");
+
+        assert!(completion.timed_out);
+        assert!(body_result.is_err());
     }
 }

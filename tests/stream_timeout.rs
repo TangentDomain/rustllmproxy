@@ -17,7 +17,7 @@ use common::{spawn_mock, spawn_proxy_with_routes, TestBackend, TestConfigBuilder
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stream_idle_timeout_triggers_without_effective_chunks() {
-    let (mock_addr, mock_handle) =
+    let (mock_addr, _mock_handle) =
         spawn_mock(Router::new().route("/v1/chat/completions", post(mock_chat_completions))).await;
 
     let config = TestConfigBuilder::new()
@@ -27,7 +27,7 @@ async fn stream_idle_timeout_triggers_without_effective_chunks() {
         .fallback_timeout_secs(3)
         .backend(TestBackend::openai("mock-backend", mock_addr))
         .build();
-    let (proxy_addr, proxy_handle) = spawn_proxy_with_routes(
+    let (proxy_addr, _proxy_handle) = spawn_proxy_with_routes(
         config,
         Router::new().route("/openai/v1/{*path}", post(openai_passthrough_handler)),
     )
@@ -41,40 +41,65 @@ async fn stream_idle_timeout_triggers_without_effective_chunks() {
         "messages": [{"role": "user", "content": "hi"}]
     });
 
-    let resp = client
-        .post(url)
-        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
-        .header("Content-Type", "application/json")
-        .body(serde_json::to_string(&body).expect("serialize body"))
-        .send()
-        .await
-        .expect("request should start");
+    for _ in 0..3 {
+        let resp = client
+            .post(url.clone())
+            .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&body).expect("serialize body"))
+            .send()
+            .await
+            .expect("request should start");
 
-    assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::OK);
 
-    let result = timeout(Duration::from_secs(5), async {
-        let mut stream = resp.bytes_stream();
-        while let Some(item) = stream.next().await {
-            match item {
-                Ok(_) => continue,
-                Err(err) => return Err(err),
+        let result = timeout(Duration::from_secs(5), async {
+            let mut stream = resp.bytes_stream();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(_) => continue,
+                    Err(err) => return Err(err),
+                }
             }
+            Ok::<(), reqwest::Error>(())
+        })
+        .await;
+
+        assert!(result.is_ok(), "stream did not terminate within timeout window");
+        let inner = result.unwrap();
+        assert!(inner.is_err(), "expected stream to end with timeout error");
+    }
+
+    let backend = timeout(Duration::from_secs(3), async {
+        loop {
+            let backends_resp = client
+                .get(format!("http://{proxy_addr}/backends"))
+                .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+                .send()
+                .await
+                .expect("backends after stream timeout");
+            assert_eq!(backends_resp.status(), StatusCode::OK);
+            let backends_text = backends_resp.text().await.expect("backends body");
+            let backends_json: serde_json::Value = serde_json::from_str(&backends_text).expect("backends json");
+            let backend = backends_json["backends"]
+                .as_array()
+                .expect("backends array")
+                .iter()
+                .find(|backend| backend["name"] == "mock-backend")
+                .expect("backend entry")
+                .clone();
+            if backend["healthy"] == false && backend["circuit_state"] == "open" {
+                break backend;
+            }
+            sleep(Duration::from_millis(50)).await;
         }
-        Ok::<(), reqwest::Error>(())
     })
-    .await;
+    .await
+    .expect("backend health update timeout");
 
-    assert!(
-        result.is_ok(),
-        "stream did not terminate within timeout window"
-    );
-    let inner = result.unwrap();
-    assert!(inner.is_err(), "expected stream to end with timeout error");
-
-    proxy_handle.abort();
-    mock_handle.abort();
+    assert_eq!(backend["healthy"], false);
+    assert_eq!(backend["circuit_state"], "open");
 }
-
 async fn openai_passthrough_handler(
     State(proxy): State<Arc<llmproxy::proxy::Proxy>>,
     mut req: axum::http::Request<Body>,
