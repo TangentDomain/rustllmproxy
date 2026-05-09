@@ -128,9 +128,14 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    // 提取 API key
-    let key = extract_client_credential_from_request(&request);
-    let key = match key {
+    let auth = authorize_request(&state, &request)?;
+    request.extensions_mut().insert(auth);
+
+    Ok(next.run(request).await)
+}
+
+fn authorize_request<B>(state: &AppState, request: &axum::http::Request<B>) -> Result<AuthInfo, StatusCode> {
+    let key = match extract_client_credential_from_request(request) {
         Some(k) => k,
         None => {
             tracing::info!("请求缺少认证信息");
@@ -138,9 +143,7 @@ pub async fn auth_middleware(
         }
     };
 
-    // 校验 key
-    let api_key = state.config.find_api_key(&key);
-    let api_key = match api_key {
+    let api_key = match state.config.find_api_key(&key) {
         Some(k) => k,
         None => {
             tracing::warn!("无效的API key");
@@ -148,18 +151,14 @@ pub async fn auth_middleware(
         }
     };
 
-    // 限流检查
     if !state.limiter.check(&key, api_key.rate_limit) {
         tracing::info!("key [{}] 触发限流", api_key.name);
         return Err(StatusCode::TOO_MANY_REQUESTS);
     }
 
-    // 存储认证信息供后续 handler 使用
-    request.extensions_mut().insert(AuthInfo {
+    Ok(AuthInfo {
         key_name: api_key.name.clone(),
-    });
-
-    Ok(next.run(request).await)
+    })
 }
 
 // 兼容旧的私有函数名，避免未来局部回滚/对比时误改调用点。
@@ -176,8 +175,10 @@ fn extract_api_key<B>(request: &Request<B>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_api_key, RateLimitEntry, RateLimiter};
+    use super::{authorize_request, extract_api_key, AppState, RateLimitEntry, RateLimiter};
     use axum::http::Request;
+    use std::collections::HashMap;
+    use crate::config::{ApiKey, AuthConfig, Config, ServerConfig};
     use std::time::{Duration, Instant};
 
     #[test]
@@ -261,6 +262,113 @@ mod tests {
         for i in 0..128 {
             assert!(limiter.check(&format!("key-{i}"), 2));
         }
+    }
+
+    #[test]
+    fn extract_api_key_returns_none_without_supported_credentials() {
+        let request = Request::builder()
+            .uri("/openai/v1/chat/completions?foo=1")
+            .header("authorization", "Token abc")
+            .body(())
+            .expect("request");
+        assert_eq!(extract_api_key(&request), None);
+    }
+
+    #[test]
+    fn rate_limiter_rejects_after_limit_and_keeps_independent_keys() {
+        let limiter = RateLimiter::new();
+        assert!(limiter.check("key-a", 2));
+        assert!(limiter.check("key-a", 2));
+        assert!(!limiter.check("key-a", 2));
+        assert!(limiter.check("key-b", 1));
+        assert!(!limiter.check("key-b", 1));
+    }
+
+    #[test]
+    fn rate_limiter_resets_count_after_window_elapsed() {
+        let limiter = RateLimiter::new();
+        limiter.entries.insert(
+            "stale-window-key".to_string(),
+            RateLimitEntry {
+                count: 99,
+                window_start: Instant::now() - Duration::from_secs(60),
+            },
+        );
+
+        assert!(limiter.check("stale-window-key", 1));
+        assert!(!limiter.check("stale-window-key", 1));
+    }
+
+    fn test_state(rate_limit: u32) -> AppState {
+        AppState {
+            config: Config {
+                server: ServerConfig {
+                    port: 0,
+                    timeout_secs: 1,
+                    log_dir: "target/test-logs".to_string(),
+                    stream_idle_timeout_secs: 1,
+                    stream_first_chunk_timeout_secs: 1,
+                    fallback_timeout_secs: 1,
+                    recovery_cooldown_secs: 1,
+                },
+                r#type: "test".to_string(),
+                auth: AuthConfig {
+                    enabled: true,
+                    keys: vec![ApiKey {
+                        key: "valid-key".to_string(),
+                        name: "valid-name".to_string(),
+                        rate_limit,
+                    }],
+                    key_index: HashMap::from([("valid-key".to_string(), 0)]),
+                },
+                backends: Vec::new(),
+                retry: 0,
+                retry_delay_ms: 0,
+                fallback: HashMap::new(),
+                model_mapping: HashMap::new(),
+            },
+            limiter: RateLimiter::new(),
+        }
+    }
+
+    #[test]
+    fn authorize_request_rejects_missing_and_invalid_credentials() {
+        let state = test_state(10);
+        let missing = Request::builder()
+            .uri("/openai/v1/chat/completions")
+            .body(())
+            .expect("missing credential request");
+        let invalid = Request::builder()
+            .uri("/openai/v1/chat/completions")
+            .header("authorization", "Bearer invalid-key")
+            .body(())
+            .expect("invalid credential request");
+
+        assert_eq!(
+            authorize_request(&state, &missing).err(),
+            Some(axum::http::StatusCode::UNAUTHORIZED)
+        );
+        assert_eq!(
+            authorize_request(&state, &invalid).err(),
+            Some(axum::http::StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn authorize_request_allows_valid_key_and_enforces_rate_limit() {
+        let state = test_state(1);
+        let request = Request::builder()
+            .uri("/openai/v1/chat/completions")
+            .header("authorization", "Bearer valid-key")
+            .body(())
+            .expect("valid credential request");
+
+        let auth = authorize_request(&state, &request).expect("first request allowed");
+        assert_eq!(auth.key_name, "valid-name");
+        assert_eq!(
+            authorize_request(&state, &request).err(),
+            Some(axum::http::StatusCode::TOO_MANY_REQUESTS)
+        );
     }
 }
 /// 认证信息，注入到 request extensions
