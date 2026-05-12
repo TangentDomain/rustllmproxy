@@ -295,6 +295,27 @@ async fn ready_endpoint_is_public_and_reports_not_ready_when_all_backends_open()
     mock_handle.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn livez_is_public() {
+    let config = TestConfigBuilder::new().build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+
+    let resp = client
+        .get(format!("http://{proxy_addr}/livez"))
+        .send()
+        .await
+        .expect("livez request");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = resp.text().await.expect("livez body");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("livez json");
+    assert_eq!(json["decision"]["decision"], "Live");
+    assert!(json["snapshot"]["last_runtime_tick_ms"].as_u64().unwrap_or_default() > 0);
+
+    proxy_handle.abort();
+}
+
 async fn spawn_capture_mock(
     route: &'static str,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,

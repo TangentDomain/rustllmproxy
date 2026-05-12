@@ -6,6 +6,7 @@ retry_delay_ms = 500
 port = 8091
 timeout_secs = 300
 log_dir = "logs-dev"
+watchdog_enabled = false
 
 [auth]
 enabled = true

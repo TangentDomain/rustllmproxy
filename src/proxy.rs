@@ -36,7 +36,7 @@ use crate::middleware::RateLimiter;
 use crate::response_meta::inject_non_stream_response_headers;
 use crate::selection::{choose_weighted_index, WeightFill};
 use crate::streaming::instrument_stream;
-
+use crate::runtime_health::RuntimeHealthError;
 /// 转发错误分类，决定后续行为
 enum ForwardError {
     /// 4xx 客户端错误 → 直接返回，不fallback
@@ -58,6 +58,10 @@ pub struct Proxy {
     /// 按 connect_timeout_secs 分组缓存的 reqwest client（避免热路径重复 build）
     client_cache: Arc<std::collections::HashMap<u64, Client>>,
     store: Arc<MetricsStore>,
+    /// 运行态健康度：供 /livez 与未来 watchdog 使用。
+    ///
+    /// 约束：必须是低开销、无锁、无阻塞。
+    runtime_health: crate::runtime_health::RuntimeHealth,
 }
 
 impl Proxy {
@@ -91,6 +95,7 @@ impl Proxy {
             client_cache: Arc::new(client_cache),
             metrics: Arc::new(BackendMetrics::new(10)),
             store: Arc::new(MetricsStore::new(&format!("{log_dir}/metrics"))),
+            runtime_health: crate::runtime_health::RuntimeHealth::new(),
         }
     }
 
@@ -101,6 +106,10 @@ impl Proxy {
     pub fn config(&self) -> &Arc<Config> {
         &self.config
     }
+    pub fn runtime_health(&self) -> &crate::runtime_health::RuntimeHealth {
+        &self.runtime_health
+    }
+
     pub fn readiness_snapshot(&self) -> ReadinessSnapshot {
         let backends = self.balancer.backend_statuses();
         let ready_backends = backends.iter().filter(|backend| backend.ready).count();
@@ -146,11 +155,43 @@ impl Proxy {
 
         let protocol = parts.extensions.get::<String>().map(String::as_str);
 
-        let bytes = match axum::body::to_bytes(body, 10 * 1024 * 1024).await {
-            Ok(b) => b,
-            Err(e) => {
+        // ingress: 记录请求进入代理热路径（尽量靠前，且不跨 await 持有状态）。
+        self.runtime_health.request_started(now_ms());
+        struct RequestInflightGuard {
+            runtime_health: crate::runtime_health::RuntimeHealth,
+        }
+        impl Drop for RequestInflightGuard {
+            fn drop(&mut self) {
+                self.runtime_health.request_finished();
+            }
+        }
+        let _inflight_guard = RequestInflightGuard {
+            runtime_health: self.runtime_health.clone(),
+        };
+
+        // body read tracking + timeout
+        let body_read_start_ms = now_ms();
+        self.runtime_health.body_read_started(body_read_start_ms);
+        let bytes = match tokio::time::timeout(
+            Duration::from_secs(self.config.server.body_read_timeout_secs),
+            axum::body::to_bytes(body, 10 * 1024 * 1024),
+        )
+        .await
+        {
+            Ok(Ok(b)) => {
+                self.runtime_health.body_read_finished(now_ms());
+                b
+            }
+            Ok(Err(e)) => {
+                self.runtime_health.body_read_finished(now_ms());
                 error!("Failed to read request body: {e}");
                 return (StatusCode::BAD_REQUEST, "Failed to read body").into_response();
+            }
+            Err(_) => {
+                self.runtime_health.body_read_finished(now_ms());
+                self.runtime_health.record_error(RuntimeHealthError::BodyReadTimeout, now_ms());
+                warn!("Request body read timed out (>{}s)", self.config.server.body_read_timeout_secs);
+                return (StatusCode::REQUEST_TIMEOUT, "Request body read timed out").into_response();
             }
         };
 
@@ -294,6 +335,7 @@ impl Proxy {
                                 stream_total_timeout,
                                 self.metrics.clone(),
                                 self.store.clone(),
+                                self.runtime_health.clone(),
                                 request_id.clone(),
                             );
                             let mut resp = Response::new(new_body);
@@ -794,6 +836,21 @@ pub async fn run_server_with_listener(
     extra_routes: Router<Arc<Proxy>>,
     listener: tokio::net::TcpListener,
 ) {
+    run_server_with_listener_and_hook(config, extra_routes, listener, |_| {} ).await;
+}
+
+/// 运行 server 并允许在 Proxy 构建完成后执行一个 hook。
+///
+/// 约束：hook 只用于非热路径初始化（例如 watchdog），禁止在其中做阻塞 I/O。
+pub async fn run_server_with_listener_and_hook<F>(
+    config: Config,
+    extra_routes: Router<Arc<Proxy>>,
+    listener: tokio::net::TcpListener,
+    on_proxy_ready: F,
+ )
+where
+    F: FnOnce(Arc<Proxy>) + Send + 'static,
+{
     let config = Arc::new(config);
     let balancer = Arc::new(WeightedRoundRobin::with_recovery_cooldown(
         config.backends.clone(),
@@ -807,9 +864,15 @@ pub async fn run_server_with_listener(
     // Start health check
     balancer.start_health_check(Duration::from_secs(30));
 
-    let app = build_app(proxy.clone(), extra_routes);
-    start_metrics_maintenance_task(proxy.store.clone());
+    // Tokio runtime tick：用于观测 runtime 是否在持续推进。
+    // 注意：这里只做轻量 Atomic 写入；不要引入 I/O 或锁。
+    start_runtime_tick_task(proxy.runtime_health.clone());
 
+    // hook: 允许 unified.rs 启动 watchdog 等非热路径逻辑。
+    on_proxy_ready(proxy.clone());
+
+    let app = build_app(proxy.clone(), extra_routes);
+    start_metrics_maintenance_task(proxy.store.clone(), proxy.runtime_health.clone());
     info!("Listening on {addr}");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -829,8 +892,8 @@ fn build_app(proxy: Arc<Proxy>, extra_routes: Router<Arc<Proxy>>) -> Router {
             "/health",
             get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         )
-        .route("/ready", get(readiness_handler));
-
+        .route("/ready", get(readiness_handler))
+        .route("/livez", get(livez_handler));
     // 受保护路由（需要认证）
     let protected_routes = Router::new()
         .route("/backends", get(backends_handler))
@@ -854,22 +917,42 @@ fn build_app(proxy: Arc<Proxy>, extra_routes: Router<Arc<Proxy>>) -> Router {
 ///
 /// - flush() 为同步磁盘 IO，必须放到 spawn_blocking
 /// - 清理 24h 无新数据的 entry，防止 DashMap 键空间无限增长
-fn start_metrics_maintenance_task(store: Arc<MetricsStore>) {
+fn start_metrics_maintenance_task(
+    store: Arc<MetricsStore>,
+    runtime_health: crate::runtime_health::RuntimeHealth,
+ ) {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
             let store = store.clone();
+            let runtime_health = runtime_health.clone();
             // flush() does synchronous disk IO; keep it off Tokio worker threads.
-            let _ = tokio::task::spawn_blocking(move || {
+            let ok = tokio::task::spawn_blocking(move || {
                 store.flush();
                 store.evict_stale(24 * 3600);
             })
-            .await;
+            .await
+            .is_ok();
+            if ok {
+                runtime_health.tick_metrics_flush_ok(now_ms());
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }
 
-fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
+/// 每秒更新一次 runtime tick，供 /livez 与未来 watchdog 读取。
+fn start_runtime_tick_task(runtime_health: crate::runtime_health::RuntimeHealth) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            runtime_health.tick_runtime(now_ms());
+        }
+    });
+}
+
+/// 绑定 TCP listener（共享给 binary 入口与测试）。
+pub fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
     use tokio::net::TcpSocket;
 
     let tcp_socket = TcpSocket::new_v4().expect("failed to create TCP socket");
@@ -881,6 +964,13 @@ fn bind_listener(addr: SocketAddr) -> tokio::net::TcpListener {
         .expect("failed to set keepalive");
     tcp_socket.bind(addr).expect("failed to bind");
     tcp_socket.listen(1024).expect("failed to listen")
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 async fn backends_handler(State(proxy): State<Arc<Proxy>>) -> axum::Json<serde_json::Value> {
@@ -937,6 +1027,30 @@ async fn readiness_handler(State(proxy): State<Arc<Proxy>>) -> impl IntoResponse
     )
 }
 
+/// /livez：运行时活性探针（必须 public）。
+///
+/// 设计目标：轻量、无阻塞、无锁跨 await。
+async fn livez_handler(State(proxy): State<Arc<Proxy>>) -> impl IntoResponse {
+    let now_ms = now_ms();
+    let snapshot = proxy.runtime_health.snapshot(now_ms);
+    let decision = crate::runtime_health::decide(&snapshot);
+    let decision_str = match decision.decision {
+        crate::runtime_health::Decision::Live => "Live",
+        crate::runtime_health::Decision::Suspect => "Suspect",
+        crate::runtime_health::Decision::Stalled => "Stalled",
+    };
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "snapshot": snapshot,
+            "decision": {
+                "decision": decision_str,
+                "reason": decision.reason,
+            }
+        })),
+    )
+}
+
 async fn shutdown_signal() {
     let ctrl_c = async {
         signal::ctrl_c().await.expect("failed to listen for ctrl+c");
@@ -964,7 +1078,10 @@ async fn shutdown_signal() {
 }
 #[cfg(test)]
 mod tests {
-    use super::{backends_handler, estimate_tokens_from_body_json, extract_bearer_key, extract_completion_tokens_from_json, readiness_handler, Proxy};
+    use super::{
+        backends_handler, estimate_tokens_from_body_json, extract_bearer_key,
+        extract_completion_tokens_from_json, livez_handler, readiness_handler, Proxy,
+    };
     use crate::balancer::WeightedRoundRobin;
     use crate::config::{AuthConfig, Config, ServerConfig};
     use axum::extract::State;
@@ -1006,6 +1123,11 @@ mod tests {
                 stream_first_chunk_timeout_secs: 1,
                 fallback_timeout_secs: 1,
                 recovery_cooldown_secs: 1,
+                body_read_timeout_secs: 30,
+                watchdog_enabled: false,
+                watchdog_check_interval_ms: 2_000,
+                watchdog_runtime_tick_stall_ms: 5_000,
+                watchdog_restart_cooldown_secs: 120,
             },
             r#type: "test".to_string(),
             auth: AuthConfig {
@@ -1051,6 +1173,15 @@ mod tests {
         let response = readiness_handler(State(empty_proxy())).await.into_response();
 
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn livez_handler_returns_snapshot_and_live_decision_after_tick() {
+        let proxy = empty_proxy();
+        proxy.runtime_health.tick_runtime(super::now_ms());
+
+        let response = livez_handler(State(proxy)).await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[test]

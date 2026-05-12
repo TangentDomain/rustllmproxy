@@ -8,6 +8,7 @@ use tracing::{info, warn};
 
 use crate::backend_metrics::BackendMetrics;
 use crate::metrics::MetricsStore;
+use crate::runtime_health::RuntimeHealth;
 
 #[derive(Debug)]
 pub struct StreamCompletion {
@@ -27,12 +28,25 @@ pub fn instrument_stream(
     stream_total_timeout: Duration,
     metrics: Arc<BackendMetrics>,
     store: Arc<MetricsStore>,
+    runtime_health: RuntimeHealth,
     request_id: String,
 ) -> (Body, JoinHandle<StreamCompletion>) {
     let rid = request_id.clone();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(64);
 
+    runtime_health.inflight_streams_inc();
+
     let done = tokio::spawn(async move {
+        struct StreamInflightGuard {
+            runtime_health: RuntimeHealth,
+        }
+
+        impl Drop for StreamInflightGuard {
+            fn drop(&mut self) {
+                self.runtime_health.inflight_streams_dec();
+            }
+        }
+
         use http_body_util::BodyExt;
 
         let mut body = std::pin::pin!(body);
@@ -47,6 +61,9 @@ pub fn instrument_stream(
         let mut effective_chunk_seen = false;
         let mut last_effective_activity = tokio::time::Instant::now();
         let stream_total_deadline = tokio::time::Instant::now() + stream_total_timeout;
+        let _stream_inflight_guard = StreamInflightGuard {
+            runtime_health: runtime_health.clone(),
+        };
 
         loop {
             let idle_timeout = if effective_chunk_seen {
@@ -120,10 +137,9 @@ pub fn instrument_stream(
 
                             if let Some(sse_data) = line.strip_prefix(b"data: ") {
                                 if sse_data != b"[DONE]" {
-                                    saw_effective_chunk = true;
                                     if let Ok(text) = std::str::from_utf8(sse_data) {
-                                        if !in_thinking && text.contains(r#"\"type\":\"thinking\""#)
-                                        {
+                                        let is_effective_chunk = is_effective_sse_chunk(text);
+                                        if !in_thinking && text.contains(r#"\"type\":\"thinking\""#) {
                                             in_thinking = true;
                                             info!(
                                                 "[{}] [THINKING] Started on {} via {}",
@@ -138,11 +154,7 @@ pub fn instrument_stream(
                                             in_thinking = false;
                                             info!("[{}] [THINKING] Ended on {} via {} (elapsed: {}ms)", rid, model, backend_name, t_start.elapsed().as_millis());
                                         }
-                                        if first_text_token.is_none()
-                                            && (text.contains("\"text_delta\"")
-                                                || text.contains("\"content\":\"")
-                                                || text.contains("\"reasoning_content\":\""))
-                                        {
+                                        if first_text_token.is_none() && is_effective_chunk {
                                             first_text_token = Some(Instant::now());
                                         }
                                         append_content_text(text, &mut content_text);
@@ -171,6 +183,7 @@ pub fn instrument_stream(
                                             tokens_at_last_check = current_token_count;
                                             last_speed_check = Instant::now();
                                         }
+                                        saw_effective_chunk |= is_effective_chunk;
                                     }
                                 }
                             }
@@ -190,8 +203,8 @@ pub fn instrument_stream(
                 if saw_effective_chunk {
                     effective_chunk_seen = true;
                     last_effective_activity = tokio::time::Instant::now();
+                    runtime_health.tick_effective_stream_chunk(current_unix_ms());
                 }
-
                 if tx.send(Ok(data)).await.is_err() {
                     info!("[{}] [STREAM] Client disconnected: {} via {} (tokens so far: {}, thinking={})", rid, model, backend_name, content_text.len(), in_thinking);
                     break;
@@ -234,6 +247,21 @@ pub fn instrument_stream(
 
     let new_body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(rx));
     (new_body, done)
+}
+
+fn current_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// "有效 chunk"：有真实内容/token 的 SSE data，role-only/keepalive 不算。
+fn is_effective_sse_chunk(text: &str) -> bool {
+    text.contains("\"text_delta\"")
+        || text.contains("\"content\":\"")
+        || text.contains("\"reasoning_content\":\"")
+        || text.contains("\"thinking\":\"")
 }
 
 /// Extract text from content, reasoning_content, and thinking fields.
@@ -501,9 +529,9 @@ mod tests {
             Duration::from_secs(5),
             Arc::clone(&metrics),
             Arc::clone(&store),
+            RuntimeHealth::new(),
             "rid-success".to_string(),
         );
-
         let bytes = instrumented
             .collect()
             .await
@@ -541,9 +569,9 @@ mod tests {
             Duration::from_secs(1),
             metrics,
             store,
+            RuntimeHealth::new(),
             "rid-timeout".to_string(),
         );
-
         let body_result = instrumented.collect().await;
         let completion = done.await.expect("stream task");
 
@@ -584,13 +612,70 @@ mod tests {
             Duration::from_secs(1),
             metrics,
             store,
+            RuntimeHealth::new(),
             "rid-idle-timeout".to_string(),
         );
-
         let body_result = instrumented.collect().await;
         let completion = done.await.expect("stream task");
 
         assert!(completion.timed_out);
         assert!(body_result.is_err());
+    }
+
+
+    #[tokio::test]
+    async fn instrument_stream_updates_runtime_health_only_for_effective_chunks() {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n",
+            ));
+            sleep(TokioDuration::from_millis(5)).await;
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+            ));
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"data: [DONE]\n\n"));
+        };
+        let body = Body::from_stream(stream);
+        let metrics = Arc::new(BackendMetrics::new(5));
+        let store = Arc::new(MetricsStore::new(
+            "target/test-metrics/streaming_updates_runtime_health_only_for_effective_chunks",
+        ));
+        let runtime_health = RuntimeHealth::new();
+
+        let before = runtime_health.snapshot(current_unix_ms());
+        assert_eq!(before.inflight_streams, 0);
+        assert_eq!(before.last_effective_stream_chunk_ms, None);
+
+        let (instrumented, done) = instrument_stream(
+            body,
+            "mock-model".to_string(),
+            "resolved-model".to_string(),
+            "backend-a".to_string(),
+            Duration::from_millis(1),
+            Instant::now(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            metrics,
+            store,
+            runtime_health.clone(),
+            "rid-health".to_string(),
+        );
+
+        let body_bytes = instrumented
+            .collect()
+            .await
+            .expect("instrumented body")
+            .to_bytes();
+        let completion = done.await.expect("stream task");
+        let after = runtime_health.snapshot(current_unix_ms());
+
+        assert!(!completion.timed_out);
+        assert!(std::str::from_utf8(&body_bytes).expect("utf8 body").contains("hello"));
+        assert_eq!(after.inflight_streams, 0, "snapshot={after:?}");
+        assert!(
+            after.last_effective_stream_chunk_ms.is_some(),
+            "snapshot={after:?}"
+        );
     }
 }

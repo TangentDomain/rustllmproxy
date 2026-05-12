@@ -1,6 +1,7 @@
 use llmproxy::binlib::unified_routes::protocol_routes;
 use llmproxy::config::Config;
 use llmproxy::proxy;
+use llmproxy::watchdog::{spawn_reexec, start_watchdog_thread, WatchdogConfig};
 
 #[tokio::main]
 async fn main() {
@@ -44,7 +45,46 @@ async fn main() {
     );
     tracing::info!("Loaded config: {}", config_path);
 
-    proxy::run_server(config, protocol_routes()).await;
+    let watchdog_cfg = WatchdogConfig {
+        enabled: config.server.watchdog_enabled,
+        check_interval: std::time::Duration::from_millis(config.server.watchdog_check_interval_ms),
+        runtime_tick_stall: std::time::Duration::from_millis(
+            config.server.watchdog_runtime_tick_stall_ms,
+        ),
+        restart_cooldown: std::time::Duration::from_secs(
+            config.server.watchdog_restart_cooldown_secs,
+        ),
+    };
+
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], config.server.port));
+    let listener = proxy::bind_listener(addr);
+
+    proxy::run_server_with_listener_and_hook(config, protocol_routes(), listener, move |proxy| {
+        if !watchdog_cfg.enabled {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("watchdog current_exe failed: {e}");
+                return;
+            }
+        };
+        let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        let runtime_health = proxy.runtime_health().clone();
+        let spawn_action = move |_snap: &llmproxy::runtime_health::RuntimeHealthSnapshot| {
+            match spawn_reexec(&exe, &args) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::error!("watchdog spawn re-exec failed: {e}");
+                    false
+                }
+            }
+        };
+        start_watchdog_thread(runtime_health, watchdog_cfg.clone(), spawn_action);
+        tracing::info!("watchdog started");
+    })
+    .await;
 }
 
 fn config_path_from_args<I, S>(args: I) -> String

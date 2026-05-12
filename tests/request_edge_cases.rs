@@ -2,12 +2,15 @@ mod common;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::post;
 use axum::{Json, Router};
 use common::{spawn_mock, spawn_proxy, TestBackend, TestConfigBuilder, TEST_API_KEY};
+use futures::StreamExt;
+use llmproxy::runtime_health::RuntimeHealthSnapshot;
 use reqwest::Client;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -260,4 +263,71 @@ async fn nested_negative_max_tokens_does_not_reject_request() {
 
     proxy_handle.abort();
     mock_handle.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_body_triggers_body_read_timeout_and_updates_livez_snapshot() {
+    let body_read_timeout_secs = 1u64;
+    let config = TestConfigBuilder::new()
+        .body_read_timeout_secs(body_read_timeout_secs)
+        .build();
+    let (proxy_addr, proxy_handle) = spawn_proxy(config).await;
+    let client = Client::new();
+    let url = format!("http://{proxy_addr}/openai/v1/chat/completions");
+
+    let chunks = vec![
+        bytes::Bytes::from_static(b"{"),
+        bytes::Bytes::from_static(b"\"model\":\"mock-model\","),
+        bytes::Bytes::from_static(b"\"messages\":[{"),
+        bytes::Bytes::from_static(b"\"role\":\"user\",\"content\":\"hi\""),
+        bytes::Bytes::from_static(b"}]}"),
+    ];
+
+    let start = Instant::now();
+    let stream = futures::stream::iter(chunks).then(|chunk| async move {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        Ok::<_, std::convert::Infallible>(chunk)
+    });
+
+    let resp = client
+        .post(url)
+        .header("Authorization", format!("Bearer {TEST_API_KEY}"))
+        .header("Content-Type", "application/json")
+        .body(reqwest::Body::wrap_stream(stream))
+        .send()
+        .await
+        .expect("request should complete (with timeout)");
+    let elapsed = start.elapsed();
+    let status = resp.status();
+    let text = resp.text().await.expect("response body");
+
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "body={text}");
+    assert!(
+        elapsed >= Duration::from_secs(body_read_timeout_secs),
+        "elapsed={elapsed:?}"
+    );
+
+    let livez = client
+        .get(format!("http://{proxy_addr}/livez"))
+        .send()
+        .await
+        .expect("livez")
+        .text()
+        .await
+        .expect("livez body");
+    let v: serde_json::Value = serde_json::from_str(&livez).expect("parse livez json");
+    let snapshot: RuntimeHealthSnapshot =
+        serde_json::from_value(v["snapshot"].clone()).expect("snapshot deserialize");
+
+    assert_eq!(snapshot.body_read_inflight, 0, "snapshot={snapshot:?}");
+    assert!(snapshot.last_body_read_start_ms.is_some(), "snapshot={snapshot:?}");
+    assert!(snapshot.last_body_read_done_ms.is_some(), "snapshot={snapshot:?}");
+    assert!(snapshot.last_error.is_some(), "snapshot={snapshot:?}");
+    assert_eq!(
+        snapshot.last_error.as_ref().unwrap().code,
+        "body_read_timeout",
+        "snapshot={snapshot:?}"
+    );
+
+    proxy_handle.abort();
 }

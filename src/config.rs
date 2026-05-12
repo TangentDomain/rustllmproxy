@@ -34,6 +34,24 @@ pub struct ServerConfig {
     /// 熔断后进入 half-open 试探前的冷却时间（秒）
     #[serde(default = "default_recovery_cooldown_secs")]
     pub recovery_cooldown_secs: u64,
+    /// 读取请求 body 的超时（秒）。
+    ///
+    /// 说明：Proxy 在进入业务处理前会先完整读取 body（to_bytes），该过程可能被慢速上传拖死。
+    /// 该配置用于对读取阶段加 timeout，超时返回 408，并在 RuntimeHealth 记录错误。
+    #[serde(default = "default_body_read_timeout_secs")]
+    pub body_read_timeout_secs: u64,
+    /// watchdog 总开关：true 时启用 OS 线程 watchdog。
+    #[serde(default = "default_watchdog_enabled")]
+    pub watchdog_enabled: bool,
+    /// watchdog 检查间隔（毫秒）。
+    #[serde(default = "default_watchdog_check_interval_ms")]
+    pub watchdog_check_interval_ms: u64,
+    /// runtime tick 超过该阈值未更新则判定 stalled（毫秒）。
+    #[serde(default = "default_watchdog_runtime_tick_stall_ms")]
+    pub watchdog_runtime_tick_stall_ms: u64,
+    /// 触发重启后冷却时间（秒），避免 spawn 失败时 tight-loop。
+    #[serde(default = "default_watchdog_restart_cooldown_secs")]
+    pub watchdog_restart_cooldown_secs: u64,
 }
 
 fn default_log_dir() -> String {
@@ -50,6 +68,21 @@ fn default_fallback_timeout() -> u64 {
 }
 fn default_recovery_cooldown_secs() -> u64 {
     60
+}
+fn default_body_read_timeout_secs() -> u64 {
+    30
+}
+fn default_watchdog_enabled() -> bool {
+    true
+}
+fn default_watchdog_check_interval_ms() -> u64 {
+    2_000
+}
+fn default_watchdog_runtime_tick_stall_ms() -> u64 {
+    5_000
+}
+fn default_watchdog_restart_cooldown_secs() -> u64 {
+    120
 }
 #[derive(Debug, Deserialize, Clone)]
 pub struct AuthConfig {
@@ -306,6 +339,11 @@ mod tests {
                 stream_first_chunk_timeout_secs: 60,
                 fallback_timeout_secs: 300,
                 recovery_cooldown_secs: 60,
+                body_read_timeout_secs: 30,
+                watchdog_enabled: false,
+                watchdog_check_interval_ms: 2_000,
+                watchdog_runtime_tick_stall_ms: 5_000,
+                watchdog_restart_cooldown_secs: 120,
             },
             r#type: "openai".to_string(),
             auth: AuthConfig {
@@ -348,6 +386,11 @@ mod tests {
                 stream_first_chunk_timeout_secs: 60,
                 fallback_timeout_secs: 300,
                 recovery_cooldown_secs: 60,
+                body_read_timeout_secs: 30,
+                watchdog_enabled: false,
+                watchdog_check_interval_ms: 2_000,
+                watchdog_runtime_tick_stall_ms: 5_000,
+                watchdog_restart_cooldown_secs: 120,
             },
             r#type: "openai".to_string(),
             auth,

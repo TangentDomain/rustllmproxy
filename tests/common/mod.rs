@@ -72,6 +72,7 @@ pub struct TestConfigBuilder {
     stream_idle_timeout_secs: u64,
     stream_first_chunk_timeout_secs: u64,
     fallback_timeout_secs: u64,
+    body_read_timeout_secs: u64,
     backends: Vec<TestBackend>,
     fallback: HashMap<String, Vec<String>>,
     model_mapping: HashMap<String, Vec<String>>,
@@ -88,6 +89,7 @@ impl TestConfigBuilder {
             stream_idle_timeout_secs: 10,
             stream_first_chunk_timeout_secs: 10,
             fallback_timeout_secs: 10,
+            body_read_timeout_secs: 30,
             backends: Vec::new(),
             fallback: HashMap::new(),
             model_mapping: HashMap::new(),
@@ -150,6 +152,11 @@ impl TestConfigBuilder {
         self.recovery_cooldown_secs = secs;
         self
     }
+
+    pub fn body_read_timeout_secs(mut self, secs: u64) -> Self {
+        self.body_read_timeout_secs = secs;
+        self
+    }
     pub fn build(self) -> Config {
         let backends = self
             .backends
@@ -178,6 +185,11 @@ impl TestConfigBuilder {
                 stream_first_chunk_timeout_secs: self.stream_first_chunk_timeout_secs,
                 fallback_timeout_secs: self.fallback_timeout_secs,
                 recovery_cooldown_secs: self.recovery_cooldown_secs,
+                body_read_timeout_secs: self.body_read_timeout_secs,
+                watchdog_enabled: false,
+                watchdog_check_interval_ms: 2_000,
+                watchdog_runtime_tick_stall_ms: 5_000,
+                watchdog_restart_cooldown_secs: 120,
             },
             r#type: "openai".to_string(),
             auth: AuthConfig {

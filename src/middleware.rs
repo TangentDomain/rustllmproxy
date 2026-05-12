@@ -310,6 +310,11 @@ mod tests {
                     stream_first_chunk_timeout_secs: 1,
                     fallback_timeout_secs: 1,
                     recovery_cooldown_secs: 1,
+                    body_read_timeout_secs: 30,
+                    watchdog_enabled: false,
+                    watchdog_check_interval_ms: 2_000,
+                    watchdog_runtime_tick_stall_ms: 5_000,
+                    watchdog_restart_cooldown_secs: 120,
                 },
                 r#type: "test".to_string(),
                 auth: AuthConfig {

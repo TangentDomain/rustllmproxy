@@ -14,7 +14,7 @@ rate_limit = 9999
 port = 8092
 timeout_secs = 10
 log_dir = "logs-mock"
-
+watchdog_enabled = false
 
 [fallback]
 "mock-model" = []
