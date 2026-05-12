@@ -35,7 +35,11 @@ fn output_path_for(log_path: &str) -> String {
 }
 
 fn generated_at_now() -> String {
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+    let bj = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+    chrono::Local::now()
+        .with_timezone(&bj)
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string()
 }
 
 #[cfg(test)]

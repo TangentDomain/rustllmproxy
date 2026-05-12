@@ -3,6 +3,21 @@ use llmproxy::config::Config;
 use llmproxy::proxy;
 use llmproxy::watchdog::{spawn_reexec, start_watchdog_thread, WatchdogConfig};
 
+/// 北京时间 (UTC+8) 的 tracing 时间格式化器。
+/// 使用 chrono FixedOffset 确保无论系统时区如何，日志时间始终为北京时间。
+struct BeijingTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for BeijingTime {
+    fn format_time(
+        &self,
+        w: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        let bj = now.with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        write!(w, "{}", bj.format("%Y-%m-%dT%H:%M:%S%.3f"))
+    }
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
@@ -25,6 +40,7 @@ async fn main() {
         .with(
             tracing_subscriber::fmt::Layer::new()
                 .with_writer(std::io::stdout)
+                .with_timer(BeijingTime)
                 .with_ansi(atty::is(atty::Stream::Stdout))
                 .with_target(false)
                 .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
@@ -33,6 +49,7 @@ async fn main() {
         .with(
             tracing_subscriber::fmt::Layer::new()
                 .with_writer(non_blocking)
+                .with_timer(BeijingTime)
                 .with_ansi(false)
                 .with_target(false),
         )

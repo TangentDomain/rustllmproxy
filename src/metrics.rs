@@ -3,6 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// 返回当前北京时间 (UTC+8) 的 DateTime。
+/// 无论系统时区如何，始终使用固定偏移 UTC+8。
+fn bj_now() -> chrono::DateTime<chrono::FixedOffset> {
+    chrono::Local::now().with_timezone(
+        &chrono::FixedOffset::east_opt(8 * 3600).unwrap(),
+    )
+}
+
 /// Single request metric sample
 #[derive(Serialize, Deserialize, Clone)]
 struct Sample {
@@ -90,7 +98,7 @@ impl ModelFile {
             avg_ttft_ms: samples.iter().map(|s| s.ttft_ms as f64).sum::<f64>() / n,
             avg_total_ms: samples.iter().map(|s| s.total_ms as f64).sum::<f64>() / n,
             avg_tokens: samples.iter().map(|s| s.tokens as f64).sum::<f64>() / n,
-            last_updated: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            last_updated: bj_now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             recent: samples.iter().rev().take(100).cloned().collect(),
         }
     }
@@ -132,7 +140,7 @@ impl MetricsStore {
             return;
         }
         let sample = Sample {
-            time: chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
+            time: bj_now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             tok_per_sec,
             ttfb_ms,
             ttft_ms,
@@ -203,7 +211,7 @@ impl MetricsStore {
     /// 清理长时间无新数据的 entry，防止 DashMap 键空间无限增长。
     /// 保留最近 max_age_secs 秒内有数据的 entry，删除其余的。
     pub fn evict_stale(&self, max_age_secs: u64) {
-        let cutoff = chrono::Local::now() - chrono::Duration::seconds(max_age_secs as i64);
+        let cutoff = bj_now() - chrono::Duration::seconds(max_age_secs as i64);
         let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
         self.data.retain(|key, samples| {
             // 保留最后一个 sample 时间在 cutoff 之后的 entry
