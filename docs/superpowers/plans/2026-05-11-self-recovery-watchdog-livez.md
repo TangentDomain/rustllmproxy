@@ -46,7 +46,7 @@
 - Create: `src/runtime_health.rs`
 - Test: `tests/runtime_health.rs`
 
-- [ ] **Step 1: Write failing tests for decision logic**
+- [x] **Step 1: Write failing tests for decision logic**
 
 Create `tests/runtime_health.rs`:
 ```rust
@@ -88,12 +88,12 @@ fn decide_stalled_when_runtime_tick_old() {
 }
 ```
 
-- [ ] **Step 2: Run test to ensure it fails**
+- [x] **Step 2: Run test to ensure it fails**
 
 Run: `cargo test --test runtime_health -- --nocapture`
 Expected: compile error (module missing)
 
-- [ ] **Step 3: Implement RuntimeHealth minimal API**
+- [x] **Step 3: Implement RuntimeHealth minimal API**
 
 Create `src/runtime_health.rs` with:
 - `RuntimeHealth` (Arc-shared) with AtomicU64/AtomicU32
@@ -101,12 +101,12 @@ Create `src/runtime_health.rs` with:
 - `Decision` enum + `DecisionOutput { decision, reason }`
 - `snapshot()` + `decide(snapshot)`
 
-- [ ] **Step 4: Run tests; ensure PASS**
+- [x] **Step 4: Run tests; ensure PASS**
 
 Run: `cargo test --test runtime_health -- --nocapture`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/runtime_health.rs tests/runtime_health.rs
@@ -121,10 +121,10 @@ git commit -m "feat: add runtime health snapshot and decision" -m "Ultraworked w
 - Modify: `src/proxy.rs`
 - Test: `tests/protocol_routes.rs`
 
-- [ ] **Step 1: Add /livez route to public router**
-- [ ] **Step 2: Add tokio runtime tick task**
+- [x] **Step 1: Add /livez route to public router**
+- [x] **Step 2: Add tokio runtime tick task**
   - `tokio::spawn` loop 每 1s 更新 `last_runtime_tick_ms`
-- [ ] **Step 3: Add test ensuring /livez is public**
+- [x] **Step 3: Add test ensuring /livez is public**
 
 Example test snippet to add in `tests/protocol_routes.rs`:
 ```rust
@@ -141,11 +141,11 @@ async fn livez_is_public() {
 }
 ```
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 Run: `cargo test --test protocol_routes -- --nocapture`
 
-- [ ] **Step 5: Commit**
-```bash
+- [x] **Step 5: Commit**
+
 git add src/proxy.rs tests/protocol_routes.rs
 git commit -m "feat: expose unauthenticated /livez endpoint" -m "Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)"
 ```
@@ -175,8 +175,8 @@ Add fields to `ServerConfig`:
 - [x] **Step 4: Add test for slow body timeout**
 Use an axum route and a custom request body stream that yields bytes slowly, then assert proxy returns 408 within expected window.
 
-- [ ] **Step 5: Commit**
-```bash
+- [x] **Step 5: Commit**
+
 git add src/proxy.rs src/config.rs tests/body_read_timeout.rs
 git commit -m "fix: add body read timeout and ingress health ticks" -m "Ultraworked with [Sisyphus](https://github.com/code-yeongyu/oh-my-openagent)"
 ```
