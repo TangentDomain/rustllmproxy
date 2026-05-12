@@ -2,7 +2,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
-taskkill /F /IM unified-proxy.exe >nul 2>&1
+call "%~dp0stop-unified-proxy.bat" >nul 2>&1
 
 if not exist run mkdir run
 copy /Y target\release\unified-proxy.exe run\unified-proxy.exe >nul
