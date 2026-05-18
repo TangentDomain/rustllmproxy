@@ -1,5 +1,7 @@
 # AGENTS.md
 
+**Generated:** 2026-05-18 | **Commit:** 315fa0a | **Branch:** master
+
 本文件记录未来 OpenCode agent 容易踩坑、且已从本仓库验证过的高信号规则。泛化 Rust 建议不要写在这里。
 
 ## 生产安全
@@ -89,3 +91,55 @@
 - ❌ 用真实 token 作为回归测试依赖。
 - ❌ 用 Bash / Python / curl 脚本作为核心单元或集成测试依赖。
 - ❌ 在没有确认语义变化是预期的情况下自动更新 baseline。
+
+## ANTI-PATTERNS (THIS PROJECT)
+
+### 生产安全红线
+- ❌ **绝对禁止** `taskkill /F /IM unified-proxy.exe` — 按镜像名杀进程会误杀生产（8090）
+- ❌ 只操作 dev 实例：`unified-proxy-dev.exe` / 8091 / `configs/unified-dev.toml`
+- ❌ 不要假设 backend 选择顺序稳定（按健康后端和 tok/s 权重随机）
+
+### 代码质量红线
+- ❌ 不要用 `as any`、`@ts-ignore` 等类型压制
+- ❌ 不要用无依据的 `unwrap` 扩大 panic 面（现有测试/启动代码除外）
+- ❌ Bugfix 不要顺手重构 fallback、streaming、auth 或 balancer 热路径
+- ❌ 避免 `unsafe` 块（当前 codebase 无 unsafe，应保持）
+- ❌ 避免 `todo!` / `unimplemented!` / `FIXME` / `HACK` / `XXX`（当前 codebase 清洁）
+
+### 测试反模式
+- ❌ 只验证最终响应而忽略 fallback 中间步骤
+- ❌ 用真实 token 作为回归测试依赖
+- ❌ 用 Bash / Python / curl 脚本作为核心测试依赖
+- ❌ 在没有确认语义变化是预期的情况下自动更新 baseline
+
+### 热路径警告区
+- `src/balancer.rs` 的 `balancer.select().unwrap()` — 选择器状态机，有 panic 风险
+- `src/proxy.rs` 的 TCP socket 5 连 `expect()` — socket 创建/绑定链
+- `src/streaming.rs` 的 `tiktoken_rs::cl100k_base().expect()` — tokenizer 初始化
+
+## UNIQUE STYLES
+
+- **binlib 分离模式**：二进制中的纯逻辑抽到 `src/binlib/` 供测试复用，入口只负责 CLI glue
+- **北京时间日志**：自定义 `BeijingTime` formatter（`chrono::FixedOffset::east_opt(8 * 3600)`），不依赖系统时区
+- **reqwest 无 json feature**：序列化用 `serde_json::to_string()` + `.body()`，反序列化用 `.text()` + `serde_json::from_str()`
+- **随机端口测试**：所有测试绑定 `127.0.0.1:0`，通过 `listener.local_addr()` 获取分配端口
+- **熔断被动恢复**：无主动健康检查探针，后端健康由请求失败标记 + 60s 冷却自动恢复
+- **BigModel 路径改写**：智谱 OpenAI backend 转发时 `/v1/` → `/v4/`（coding API 要求）
+
+## WHERE TO LOOK
+
+| 任务 | 位置 | 备注 |
+|------|------|------|
+| 代理核心逻辑 | `src/proxy.rs` | fallback 链、请求转发、错误分类 |
+| 负载均衡 + 熔断 | `src/balancer.rs` | WeightedRoundRobin + Circuit Breaker |
+| 配置解析 | `src/config.rs` | TOML 解析、env 展开、fallback/模型映射 |
+| 流式超时控制 | `src/streaming.rs` | instrument_stream、三层超时、token 计数 |
+| 请求预处理 | `src/request_prep.rs` | 模型替换、strip_params、JSON sanitize |
+| 认证限流 | `src/middleware.rs` | API Key + rate limit |
+| 运行态健康 | `src/runtime_health.rs` | Atomic 指标，低开销 |
+| 看门狗 | `src/watchdog.rs` | runtime stall 检测 + ReExec |
+| 指标持久化 | `src/metrics.rs` | tok/s 滚动窗口、每日归档 |
+| 协议路由构建 | `src/binlib/unified_routes.rs` | OpenAI/Anthropic 路由公共定义 |
+| 测试基础设施 | `tests/common/mod.rs` | TestConfigBuilder、spawn_mock、spawn_proxy |
+| Mock 后端 | `src/bin/mock_llm_server.rs` | 独立 binary，支持 MOCK_PORT 等环境变量 |
+| 日志分析 | `src/bin/log_analyzer.rs` / `src/binlib/log_analyzer.rs` | 解析日志生成 Markdown 报告 |
